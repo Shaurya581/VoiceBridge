@@ -1,0 +1,38 @@
+{
+  "name": "@voicebridge/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "prisma generate --config ../../prisma.config.ts && tsx watch src/server.ts",
+    "build": "prisma generate --config ../../prisma.config.ts && tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "prisma generate --config ../../prisma.config.ts && vitest run",
+    "typecheck": "prisma generate --config ../../prisma.config.ts && tsc --noEmit -p tsconfig.json",
+    "seed": "prisma db seed --config ../../prisma.config.ts"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.0.0",
+    "@prisma/client": "^7.0.0",
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "express-rate-limit": "^8.2.1",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.6",
+    "pg": "^8.16.3",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.0.0",
+    "@types/nodemailer": "^7.0.3",
+    "@types/node": "^24.5.2",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.5"
+  }
+}

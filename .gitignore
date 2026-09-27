@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+apps/api/src/generated/prisma/
+.env
+.env.*
+!.env.example
+.DS_Store
+uploads/*
+!uploads/.gitkeep

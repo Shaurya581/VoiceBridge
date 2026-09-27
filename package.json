@@ -1,0 +1,23 @@
+{
+  "name": "voicebridge",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @voicebridge/api --filter @voicebridge/web dev",
+    "build": "pnpm --recursive build",
+    "test": "pnpm --recursive test",
+    "typecheck": "pnpm --recursive typecheck",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down"
+  },
+  "devDependencies": {
+    "dotenv": "^16.6.1",
+    "prisma": "^7.0.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
