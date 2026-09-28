@@ -4,7 +4,9 @@ import type { IncidentExtraction } from './extraction.js';
 import { resolveResponsibility } from './responsibility.js';
 import { sendNotification } from './email.js';
 import { classifySafety } from './safety.js';
-import { emergencyAlertProvider, speakStatus, normalizeLanguage } from './voice-feedback.js';
+import { speakStatus } from './voice-feedback.js';
+import { dispatchEmergencyAlert } from './emergency-alerts.js';
+import { isValidDeadline, selectEscalationPolicy } from './workflow-policy.js';
 
 export class ClarificationRequired extends Error {
   constructor(message: string, readonly options: Array<{ id: string; name: string; email: string; role: string }> = []) {
@@ -26,7 +28,7 @@ export async function createIncidentWorkflow(db: DatabaseClient, input: {
   const safety = classifySafety(report?.transcript ?? input.extraction.description);
   const extraction = safety.emergency ? { ...input.extraction, priority: 'CRITICAL' as const } : input.extraction;
   await db.voiceReport.update({ where: { id: input.voiceReportId }, data: { status: safety.emergency ? 'EMERGENCY' : 'DUPLICATE_CHECK' } });
-  const emergencyContact = safety.emergency
+  let emergencyContact = safety.emergency
     ? await db.employee.findFirst({ where: { isActive: true, ...(process.env.EMERGENCY_CONTACT_EMAIL ? { email: process.env.EMERGENCY_CONTACT_EMAIL } : { role: { in: ['MANAGER', 'ADMIN'] } }) }, orderBy: { role: 'desc' } })
     : null;
   if (!safety.emergency && extraction.asset) {
@@ -49,9 +51,12 @@ export async function createIncidentWorkflow(db: DatabaseClient, input: {
     ? await resolveExplicitAssignee(db, input.assignedEmployeeId, extraction.responsibleDepartment)
     : await resolveResponsibility(db, extraction.responsibleDepartment, extraction.responsiblePerson);
 
-  if (safety.emergency && !resolution.employeeId) {
+  if (safety.emergency && !emergencyContact) {
     const safetyContact = await db.employee.findFirst({ where: { isActive: true, role: { in: ['MANAGER', 'ADMIN'] } }, orderBy: { role: 'desc' } });
-    if (safetyContact) resolution = { employeeId: safetyContact.id, department: 'Safety / Operations', reason: 'Immediate emergency fallback contact selected by configured safety policy.', confidence: 1 };
+    if (safetyContact) {
+      emergencyContact = safetyContact;
+      if (!resolution.employeeId) resolution = { employeeId: safetyContact.id, department: 'Safety / Operations', reason: 'Immediate emergency fallback contact selected by configured safety policy.', confidence: 1 };
+    }
   }
 
   if ((!safety.emergency && extraction.requiresConfirmation && !input.confirmed) || !resolution.employeeId) {
@@ -64,11 +69,11 @@ export async function createIncidentWorkflow(db: DatabaseClient, input: {
   if (!assignee) throw new Error('Assignee no longer exists');
 
   const dueAt = new Date(extraction.deadline);
-  if (!Number.isFinite(dueAt.getTime())) throw new Error('The incident deadline is invalid');
+  if (!isValidDeadline(dueAt)) throw new Error('The incident deadline is invalid');
   const now = new Date();
   const department = resolution.department ? await db.department.findFirst({ where: { name: { equals: resolution.department, mode: 'insensitive' } } }) : null;
-  const rules = safety.emergency ? [] : await db.escalationRule.findMany({ where: { enabled: true, OR: [{ departmentId: null }, { departmentId: department?.id ?? '__none__' }] } });
-  const matchingRule = rules.find((rule) => !rule.priority || rule.priority === extraction.priority);
+  const rules = safety.emergency ? [] : await db.escalationRule.findMany({ where: { enabled: true, OR: [{ departmentId: null }, { departmentId: department?.id ?? '__none__' }] }, include: { department: true } });
+  const matchingRule = selectEscalationPolicy(rules, resolution.department, extraction.priority);
   const reminderBeforeMinutes = matchingRule?.reminderBeforeMinutes ?? 60;
   const reminderAt = new Date(Math.max(now.getTime(), dueAt.getTime() - reminderBeforeMinutes * 60_000));
   const incidentNumber = `INC-${now.getUTCFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`;
@@ -115,13 +120,13 @@ export async function createIncidentWorkflow(db: DatabaseClient, input: {
     } });
     if (!safety.emergency) await tx.reminder.create({ data: { taskId: task.id, scheduledAt: reminderAt, status: 'PENDING' } });
     await tx.voiceReport.update({ where: { id: input.voiceReportId }, data: { status: safety.emergency ? 'EMERGENCY' : 'ASSIGNED', incidentId: incident.id } });
-    if (safety.emergency) await tx.emergencyEvent.create({ data: { incidentId: incident.id, kind: 'IMMEDIATE_ALERT', status: 'PENDING', reason: safety.reason ?? 'Configured safety rule matched.', responseDeadline: new Date(now.getTime() + Number(process.env.EMERGENCY_RESPONSE_MINUTES ?? 15) * 60_000), metadata: { contactId: emergencyContact?.id ?? null } } });
+    const emergencyEvent = safety.emergency ? await tx.emergencyEvent.create({ data: { incidentId: incident.id, kind: 'IMMEDIATE_ALERT', status: 'PENDING', reason: safety.reason ?? 'Configured safety rule matched.', responseDeadline: new Date(now.getTime() + Number(process.env.EMERGENCY_RESPONSE_MINUTES ?? 15) * 60_000), metadata: { contactId: emergencyContact?.id ?? null } } }) : null;
     await tx.auditLog.createMany({ data: [
       { actorId: reporter.id, incidentId: incident.id, action: 'INCIDENT_CREATED', reason: 'Created from the confirmed voice report.', metadata: { voiceReportId: input.voiceReportId } },
       { actorId: input.actorId ?? reporter.id, incidentId: incident.id, action: 'INCIDENT_ASSIGNED', reason: resolution.reason, metadata: { assigneeId: assignee.id, department: resolution.department } },
       { actorId: reporter.id, incidentId: incident.id, action: 'TASK_CREATED', reason: safety.emergency ? 'Emergency task created; normal reminder cycle bypassed.' : 'Deadline derived from the transcript or configured priority SLA.', metadata: { taskId: task.id, deadline: dueAt.toISOString(), reminderAt: safety.emergency ? null : reminderAt.toISOString() } }
     ] });
-    return { incident, task, assignee };
+    return { incident, task, assignee, emergencyEvent };
   });
 
   if (!safety.emergency && extraction.asset) {
@@ -153,10 +158,7 @@ export async function createIncidentWorkflow(db: DatabaseClient, input: {
     console.error(JSON.stringify({ event: 'spoken_acknowledgement_failed', incidentId: created.incident.id, message: error instanceof Error ? error.message : 'unknown error' }));
   });
   if (safety.emergency) {
-    const alert = await emergencyAlertProvider().alert({ incidentId: created.incident.id, incidentNumber: created.incident.incidentNumber, reason: safety.reason ?? 'Emergency classification rule matched.', recipientId: emergencyContact?.id, recipient: emergencyContact?.email });
-    await db.emergencyEvent.updateMany({ where: { incidentId: created.incident.id, kind: 'IMMEDIATE_ALERT' }, data: { status: alert.status, alertedAt: new Date() } });
-    await db.incident.update({ where: { id: created.incident.id }, data: { emergencyStatus: alert.status } });
-    if (emergencyContact) await sendNotification(db, { kind: 'EMERGENCY_ALERT', to: emergencyContact.email, recipientId: emergencyContact.id, subject: `IMMEDIATE SAFETY ALERT: ${created.incident.incidentNumber}`, body: `${safety.reason}\n${created.incident.title}\n${created.incident.location ?? 'Location not provided'}`, incidentId: created.incident.id, taskId: created.task.id });
+    if (created.emergencyEvent) await dispatchEmergencyAlert(db, created.emergencyEvent.id);
   }
   await acknowledgement;
   if (!duplicateReviewPending) await sendNotification(db, {

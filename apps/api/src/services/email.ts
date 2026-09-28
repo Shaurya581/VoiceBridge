@@ -29,6 +29,10 @@ export class ConfiguredNotificationProvider implements NotificationProvider {
   send(db: DatabaseClient, input: NotificationInput) { return sendNotification(db, input); }
 }
 
+export function notificationProvider(): NotificationProvider {
+  return new ConfiguredNotificationProvider();
+}
+
 export async function sendNotification(db: DatabaseClient, input: NotificationInput): Promise<Notification> {
   const record = await db.notification.create({ data: {
     kind: input.kind,

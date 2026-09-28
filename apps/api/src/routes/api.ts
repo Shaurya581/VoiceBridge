@@ -426,7 +426,7 @@ export function apiRouter(db: DatabaseClient | null) {
       const escalation = await sendTaskEscalation(db, task.id, input.data.reason ?? 'A manager requested escalation.');
       return response.status(201).json({ escalation });
     } catch (error) {
-      if (error instanceof Error && error.message.includes('No manager')) return response.status(409).json({ error: error.message });
+      if (error instanceof Error && /No manager|No valid escalation policy|already has|no longer overdue|Only overdue|before its deadline|valid task deadline|Cannot escalate|Incident state changed/u.test(error.message)) return response.status(409).json({ error: error.message });
       throw error;
     }
   }));
