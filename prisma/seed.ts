@@ -1,9 +1,11 @@
 import { createDatabase } from '../apps/api/src/db.js';
 import { hashPassword } from '../apps/api/src/auth.js';
 
-const db = createDatabase();
-if (!db) throw new Error('DATABASE_URL is required to seed VoiceBridge.');
+const database = createDatabase();
+if (!database) throw new Error('DATABASE_URL is required to seed VoiceBridge.');
+const db = database;
 
+async function seed() {
 const departmentNames = ['Maintenance', 'IT', 'Security', 'Operations', 'HR', 'Facilities'];
 const departments = new Map<string, string>();
 for (const name of departmentNames) {
@@ -90,7 +92,8 @@ for (let index = 0; index < scenarios.length; index += 1) {
     responsibleDepartment: scenario.department,
     responsiblePerson: employeeSeeds.find((entry) => employees.get(entry[1]) === assigneeId)?.[0] ?? 'Assigned team member',
     priority: scenario.priority,
-    status: scenario.status,
+    status: scenario.status === 'COMPLETED' ? 'REPORTER_VERIFICATION_PENDING' : scenario.status,
+    reporterVerificationStatus: scenario.status === 'COMPLETED' ? 'PENDING' : null,
     confidence: 0.92,
     extractedData: { source: 'seed', confidence: 0.92 },
     deadline: due,
@@ -107,6 +110,7 @@ for (let index = 0; index < scenarios.length; index += 1) {
     completedAt: scenario.status === 'COMPLETED' ? new Date(due.getTime() + 30 * 60_000) : null
   } });
   await db.assignment.create({ data: { taskId: task.id, employeeId: assigneeId, assignedById: reporterId, reason: `Seeded ${scenario.department} responsibility mapping`, confidence: 0.92 } });
+  if (scenario.status === 'COMPLETED') await db.closureVerification.create({ data: { incidentId: incident.id, reporterId, attemptNumber: 1 } });
   await db.reminder.create({ data: { taskId: task.id, scheduledAt: new Date(Math.max(now.getTime(), due.getTime() - 60 * 60_000)), status: scenario.status === 'COMPLETED' ? 'FAILED' : 'PENDING' } });
   if (scenario.status === 'ESCALATED') {
     await db.escalation.create({ data: { taskId: task.id, managerId: managers.get(scenario.department)!, reason: 'Seeded overdue escalation.', level: 1 } });
@@ -117,5 +121,10 @@ for (let index = 0; index < scenarios.length; index += 1) {
 console.info('Seeded 6 departments, 19 employees, 10 incidents, and 10 tasks.');
 console.info('Demo accounts: admin@voicebridge.local, maintenance.manager@voicebridge.local, employee@voicebridge.local');
 console.info(`Demo password: ${process.env.DEMO_PASSWORD ?? 'VoiceBridgeDemo2026!'}`);
-await db.$disconnect();
+}
 
+void seed().then(() => db.$disconnect()).catch(async (error: unknown) => {
+  console.error(error);
+  await db.$disconnect();
+  process.exitCode = 1;
+});

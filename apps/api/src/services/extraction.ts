@@ -1,23 +1,28 @@
 import { z } from 'zod';
 import type { Priority } from '../generated/prisma/enums.js';
+import { classifySafety } from './safety.js';
 
 export const extractionSchema = z.object({
-  title: z.string().min(3).max(160),
-  description: z.string().min(3).max(4000),
-  abnormality: z.string().max(500).nullable(),
-  asset: z.string().max(200).nullable(),
-  location: z.string().max(300).nullable(),
-  responsibleDepartment: z.string().max(100).nullable(),
-  responsiblePerson: z.string().max(160).nullable(),
+  title: z.string().trim().min(3).max(160),
+  description: z.string().trim().min(3).max(4000),
+  abnormality: z.string().trim().max(500).nullable(),
+  asset: z.string().trim().max(200).nullable(),
+  location: z.string().trim().max(300).nullable(),
+  responsibleDepartment: z.string().trim().max(100).nullable(),
+  responsiblePerson: z.string().trim().max(160).nullable(),
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']),
   deadline: z.string().datetime(),
-  requestedAction: z.string().max(500),
+  requestedAction: z.string().trim().min(3).max(500),
   confidence: z.number().min(0).max(1),
-  missingInformation: z.array(z.string().max(160)).max(12),
+  missingInformation: z.array(z.string().trim().min(1).max(160)).max(12),
   requiresConfirmation: z.boolean()
-});
+}).strict();
 
 export type IncidentExtraction = z.infer<typeof extractionSchema>;
+
+export interface IncidentExtractionProvider {
+  extract(transcript: string, language?: string): Promise<IncidentExtraction>;
+}
 
 const departmentNames = ['Maintenance', 'Facilities', 'IT', 'Security', 'Operations', 'HR'];
 const slaHours: Record<Priority, number> = {
@@ -75,17 +80,32 @@ function deadlineFrom(transcript: string, priority: Priority, now = new Date()) 
   return new Date(now.getTime() + slaHours[priority] * 60 * 60_000);
 }
 
-function priorityFrom(transcript: string): Priority {
+function priorityFrom(transcript: string): Priority | null {
   const lower = transcript.toLowerCase();
-  if (/(exposed electrical|electric shock|fire|smoke|injur|dangerous|safety hazard|gas leak)/i.test(lower)) return 'CRITICAL';
-  if (/(stopped|shutdown|not working|urgent|strange noise|abnormal noise|leaking|overflow)/i.test(lower)) return 'HIGH';
+  if (classifySafety(transcript).emergency) return 'CRITICAL';
+  if (/(stopped|shutdown|not working|urgent|strange noise|abnormal noise|leaking|overflow|बंद|काम नहीं|तेज आवाज|अजीब आवाज|रिसाव|செயல்படவில்லை|நின்றுவிட்டது|அதிக சத்தம்|கசிவு)/iu.test(lower)) return 'HIGH';
   if (/(minor|cosmetic|low priority)/i.test(lower)) return 'LOW';
-  return 'MEDIUM';
+  return null;
 }
 
-function mockExtraction(transcript: string): IncidentExtraction {
+function deadlineNeedsConfirmation(transcript: string, language: string) {
+  const lower = transcript.toLocaleLowerCase();
+  // These are the phrases currently handled deterministically by deadlineFrom.
+  const deterministic = /\bwithin\s+\d+\s*(?:minute|min|hour|hr|day)s?\b|\bbefore\s+(?:the\s+)?(?:lunch|night shift)\b|\b(?:today|this afternoon|this evening|by tomorrow|tomorrow)\b|\bby\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/iu;
+  if (language === 'hi' || language === 'hinglish') {
+    // “kal” can mean either yesterday or tomorrow; ask the reporter to confirm it.
+    if (/\bkal\b|कल/u.test(lower)) return true;
+  }
+  return !deterministic.test(lower);
+}
+
+function actionNeedsConfirmation(transcript: string) {
+  return !/(?:\bplease\b|\bkindly\b|\bneed(?:s)? to\b|\bshould\b|\bmust\b|\bcheck\b|\binspect\b|\brepair\b|\bfix\b|\breplace\b|\bstop\b|\binform\b|\btell\b|\bnotify\b|\bcheck(?:ed)?\b|ठीक करें|जांचें|जाँचें|बताएं|करवा(?:एं|ना)?|देखें|சரிசெய்|சரிபார்க்க|தெரிவிக்க|பார்க்கவும்|நிறுத்து)/iu.test(transcript);
+}
+
+function mockExtraction(transcript: string, language = 'hi'): IncidentExtraction {
   const trimmed = transcript.trim();
-  const priority = priorityFrom(trimmed);
+  const priority = priorityFrom(trimmed) ?? 'MEDIUM';
   const asset = trimmed.match(/\b(machine\s*\d+|server(?: room)?|conveyor\s*\d+|pump\s*\d+)\b/i)?.[0] ?? null;
   const location = trimmed.match(/(?:near|at|in|on)\s+(?:the\s+)?([^,.!?]{3,80})/i)?.[1]?.trim() ?? null;
   const department = departmentFrom(trimmed);
@@ -94,7 +114,9 @@ function mockExtraction(transcript: string): IncidentExtraction {
   const missingInformation = [
     ...(!department ? ['responsible department'] : []),
     ...(!location ? ['location'] : []),
-    ...(!asset && trimmed.length < 30 ? ['asset or issue details'] : [])
+    ...(!asset && trimmed.length < 30 ? ['asset or issue details'] : []),
+    ...(deadlineNeedsConfirmation(trimmed, language) ? ['deadline'] : []),
+    ...(actionNeedsConfirmation(trimmed) ? ['requested action'] : [])
   ];
   const firstSentence = trimmed.split(/[.!?]/, 1)[0] ?? trimmed;
   return extractionSchema.parse({
@@ -110,11 +132,15 @@ function mockExtraction(transcript: string): IncidentExtraction {
     requestedAction: `Investigate and resolve: ${firstSentence}`.slice(0, 500),
     confidence,
     missingInformation,
-    requiresConfirmation: confidence < 0.65 || !department
+    requiresConfirmation: confidence < 0.65 || !department || deadlineNeedsConfirmation(trimmed, language) || actionNeedsConfirmation(trimmed)
   });
 }
 
-async function openAiExtraction(transcript: string): Promise<IncidentExtraction> {
+function extractionInstructions(language: string) {
+  return `Extract one workplace incident from the reporter's transcript. The selected language is ${language}. Preserve code-switching and operational terms; do not translate or rewrite the source transcript in the description. Return only these fields: title, description, abnormality, asset, location, responsibleDepartment, responsiblePerson, priority, deadline, requestedAction, confidence, missingInformation, requiresConfirmation. Use null for unknown nullable fields. Do not invent an employee, department, asset, location, requested action, or deadline. Use only details stated or strongly implied by the transcript. When responsibility or any material field is unclear, add it to missingInformation and set requiresConfirmation=true. If no deadline is stated, use a provisional priority SLA (LOW 48h, MEDIUM 24h, HIGH 8h, CRITICAL 1h), add "deadline" to missingInformation, and require reporter confirmation before work is assigned. Hindi "kal" is ambiguous and requires confirmation. If the reporter did not request an action, set requestedAction to "Confirm the appropriate action" and add "requested action" to missingInformation. Priority must be LOW, MEDIUM, HIGH, or CRITICAL. Treat confidence as a rough model estimate, not a calibrated probability. The backend applies deterministic safety and schema checks after your response.`;
+}
+
+async function openAiExtraction(transcript: string, language: string): Promise<IncidentExtraction> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is required when MOCK_AI=false');
   const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
@@ -129,8 +155,8 @@ async function openAiExtraction(transcript: string): Promise<IncidentExtraction>
           temperature: 0,
           response_format: { type: 'json_object' },
           messages: [
-            { role: 'system', content: `Extract an operational incident as JSON with keys title, description, abnormality, asset, location, responsibleDepartment, responsiblePerson, priority, deadline, requestedAction, confidence, missingInformation, requiresConfirmation. Never invent a person or deadline. Use ISO 8601 deadline; if absent, use a priority SLA from now (LOW 48h, MEDIUM 24h, HIGH 8h, CRITICAL 1h). If information is uncertain, lower confidence and require confirmation. Priority must be LOW, MEDIUM, HIGH, or CRITICAL.` },
-            { role: 'user', content: transcript }
+            { role: 'system', content: extractionInstructions(language) },
+            { role: 'user', content: `Source transcript (preserve its language and meaning):\n${transcript}` }
           ]
         })
       });
@@ -146,14 +172,65 @@ async function openAiExtraction(transcript: string): Promise<IncidentExtraction>
   throw lastError instanceof Error ? lastError : new Error('Unable to extract incident');
 }
 
-export async function extractIncident(transcript: string) {
-  const extraction = process.env.MOCK_AI !== 'false' ? mockExtraction(transcript) : await openAiExtraction(transcript);
-  const priority = applyPriorityRules(transcript, extraction.priority);
-  return { ...extraction, priority, requiresConfirmation: extraction.requiresConfirmation || extraction.confidence < 0.65 };
+async function ollamaExtraction(transcript: string, language: string): Promise<IncidentExtraction> {
+  const baseUrl = (process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434').replace(/\/+$/u, '');
+  const response = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(Number(process.env.LLM_TIMEOUT_MS ?? 120_000)),
+    body: JSON.stringify({
+      model: process.env.OLLAMA_MODEL ?? 'llama3.1:8b',
+      stream: false,
+      format: z.toJSONSchema(extractionSchema),
+      options: { temperature: 0 },
+      messages: [
+        { role: 'system', content: extractionInstructions(language) },
+        { role: 'user', content: `Source transcript (preserve its language and meaning):\n${transcript}` }
+      ]
+    })
+  });
+  if (!response.ok) throw new Error(`Local extraction provider failed with ${response.status}`);
+  const payload = await response.json() as { message?: { content?: string } };
+  const content = payload.message?.content;
+  if (!content) throw new Error('Local extraction provider returned no structured incident');
+  return extractionSchema.parse(JSON.parse(content));
+}
+
+function finalizeExtraction(transcript: string, value: IncidentExtraction, language: string) {
+  const parsed = extractionSchema.parse(value);
+  const priority = applyPriorityRules(transcript, parsed.priority);
+  const missingInformation = [...new Set(parsed.missingInformation)];
+  if (!parsed.responsibleDepartment && !missingInformation.includes('responsible department')) missingInformation.push('responsible department');
+  if (deadlineNeedsConfirmation(transcript, language) && !missingInformation.includes('deadline')) missingInformation.push('deadline');
+  if (actionNeedsConfirmation(transcript) && !missingInformation.includes('requested action')) missingInformation.push('requested action');
+  return {
+    ...parsed,
+    priority,
+    missingInformation,
+    requiresConfirmation: parsed.requiresConfirmation || parsed.confidence < 0.65 || missingInformation.length > 0
+  };
+}
+
+export async function extractIncident(transcript: string, language = 'hi') {
+  if (!transcript.trim()) throw new Error('Cannot extract an incident from an empty transcript');
+  const configuredProvider = process.env.LLM_PROVIDER === 'mock' && process.env.MOCK_AI === 'false'
+    ? 'openai'
+    : process.env.LLM_PROVIDER ?? (process.env.MOCK_AI === 'false' ? 'openai' : 'mock');
+  const extraction = configuredProvider === 'ollama'
+    ? await ollamaExtraction(transcript, language)
+    : configuredProvider === 'openai'
+      ? await openAiExtraction(transcript, language)
+      : configuredProvider === 'mock'
+        ? mockExtraction(transcript, language)
+        : (() => { throw new Error(`Unsupported LLM_PROVIDER: ${configuredProvider}`); })();
+  return finalizeExtraction(transcript, extraction, language);
 }
 
 export function applyPriorityRules(transcript: string, suggested: Priority): Priority {
   const rulePriority = priorityFrom(transcript);
+  if (!rulePriority) return suggested;
   const rank: Priority[] = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
   return rank.indexOf(rulePriority) > rank.indexOf(suggested) ? rulePriority : suggested;
 }
+
+export const configuredExtractionProvider: IncidentExtractionProvider = { extract: extractIncident };

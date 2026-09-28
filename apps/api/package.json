@@ -8,6 +8,7 @@
     "build": "prisma generate --config ../../prisma.config.ts && tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test": "prisma generate --config ../../prisma.config.ts && vitest run",
+    "eval:stt": "tsx src/scripts/evaluate-stt.ts",
     "typecheck": "prisma generate --config ../../prisma.config.ts && tsc --noEmit -p tsconfig.json",
     "seed": "prisma db seed --config ../../prisma.config.ts"
   },

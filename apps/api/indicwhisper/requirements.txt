@@ -1,0 +1,7 @@
+# Install in a dedicated environment; these packages are only for optional local ASR.
+accelerate>=1.2,<2
+fastapi>=0.115,<1
+python-multipart>=0.0.20,<1
+torch>=2.6,<3
+transformers>=4.48,<5
+uvicorn[standard]>=0.34,<1

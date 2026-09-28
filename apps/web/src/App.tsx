@@ -70,6 +70,7 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [transcript, setTranscript] = useState('');
+  const [reportLanguage, setReportLanguage] = useState('hi');
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState('');
   const [listeningSupported, setListeningSupported] = useState(true);
@@ -113,6 +114,9 @@ export default function App() {
     const timer = window.setInterval(() => setElapsed((value) => value + 1), 1000);
     return () => window.clearInterval(timer);
   }, [isRecording]);
+  useEffect(() => {
+    if (isRecording && elapsed >= 30) stopRecording();
+  }, [isRecording, elapsed]);
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -155,7 +159,7 @@ export default function App() {
       const Recognition = browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
       if (Recognition) {
         const recognition = new Recognition();
-        recognition.continuous = true; recognition.interimResults = true; recognition.lang = navigator.language || 'en-US';
+        recognition.continuous = true; recognition.interimResults = true; recognition.lang = reportLanguage === 'ta' ? 'ta-IN' : 'hi-IN';
         recognition.onresult = (event) => {
           const words: string[] = [];
           for (let index = 0; index < event.results.length; index += 1) words.push(event.results[index]?.[0]?.transcript ?? '');
@@ -183,16 +187,18 @@ export default function App() {
     setLoading(true); setError(''); setNotice('Understanding your report…');
     try {
       const form = new FormData();
-      form.set('transcript', transcript.trim()); form.set('durationSeconds', String(elapsed));
+      form.set('transcript', transcript.trim()); form.set('durationSeconds', String(elapsed)); form.set('language', reportLanguage);
       if (audioBlob) form.set('audio', audioBlob, `report.${audioBlob.type.includes('ogg') ? 'ogg' : audioBlob.type.includes('mp4') ? 'm4a' : 'webm'}`);
-      const result = await request<{ voiceReportId: string; extraction: Extraction; requiresConfirmation?: boolean; clarification?: string; options?: Employee[]; incident?: Incident }>('/api/voice/upload', { method: 'POST', body: form });
-      setTranscript(result.transcript);
-      if (result.requiresConfirmation) {
+      const result = await request<{ voiceReportId: string; transcript?: string; extraction?: Extraction; requiresConfirmation?: boolean; retryRequired?: boolean; duplicate?: boolean; duplicateReviewPending?: boolean; message?: string; clarification?: string; options?: Employee[]; incident?: Incident }>('/api/voice/upload', { method: 'POST', body: form });
+      if (result.transcript) setTranscript(result.transcript);
+      if (result.retryRequired) {
+        setNotice(result.message ?? 'The recording was unclear. Please record again.');
+      } else if (result.requiresConfirmation && result.extraction) {
         setPendingReport({ voiceReportId: result.voiceReportId, extraction: result.extraction, clarification: result.clarification ?? 'Please review the information before creating the incident.', options: result.options ?? [] });
         setEditedExtraction(result.extraction); setAssigneeId(result.options?.[0]?.id ?? '');
         setNotice('Review the details before we create the incident.');
       } else {
-        setNotice(`Report submitted and assigned${result.incident?.incidentNumber ? ` as ${result.incident.incidentNumber}` : ''}.`);
+        setNotice(result.duplicateReviewPending ? 'Possible duplicate queued for manager review.' : result.duplicate ? 'Your report was added to an existing incident.' : `Report received${result.incident?.incidentNumber ? ` as ${result.incident.incidentNumber}` : ''}. Spoken acknowledgement simulated.`);
         setTranscript(''); setAudioBlob(null); setAudioUrl(''); await refreshData(); setPage('reports');
       }
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Your report could not be submitted.'); setNotice(''); }
@@ -216,8 +222,10 @@ export default function App() {
   async function updateTask(task: Task, status: string) {
     setLoading(true); setError('');
     try {
-      await request(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
-      setNotice(status === 'COMPLETED' ? 'Task completed. The reporter has been notified.' : 'Task status updated.');
+      const result = await request<{ incidentStatus?: string }>(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      setNotice(status === 'COMPLETED'
+        ? result.incidentStatus === 'CLOSED' ? 'Reporter confirmed the fix. Incident closed.' : result.incidentStatus === 'REOPENED' ? 'Reporter said the issue remains. Incident reopened.' : 'Work marked complete. Reporter verification is pending.'
+        : 'Task status updated.');
       await refreshData();
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'The task could not be updated.'); }
     finally { setLoading(false); }
@@ -226,9 +234,9 @@ export default function App() {
   if (!token || !user) return <Login email={loginEmail} password={loginPassword} setEmail={setLoginEmail} setPassword={setLoginPassword} onSubmit={signIn} loading={loading} error={error} />;
 
   const filteredIncidents = incidents.filter((incident) => `${incident.incidentNumber} ${incident.title} ${incident.location ?? ''} ${incident.status}`.toLowerCase().includes(search.toLowerCase()));
-  const openCount = incidents.filter((item) => ['OPEN', 'IN_PROGRESS'].includes(item.status)).length;
+  const openCount = incidents.filter((item) => ['OPEN', 'IN_PROGRESS', 'EMERGENCY', 'REOPENED', 'REPORTER_VERIFICATION_PENDING', 'AWAITING_CONFIRMATION'].includes(item.status)).length;
   const overdueCount = incidents.filter((item) => ['OVERDUE', 'ESCALATED'].includes(item.status)).length;
-  const completedCount = incidents.filter((item) => ['COMPLETED', 'CLOSED'].includes(item.status)).length;
+  const completedCount = incidents.filter((item) => item.status === 'CLOSED').length;
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -262,7 +270,7 @@ export default function App() {
         {notice && <div className="alert notice-alert"><Check size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={16} /></button></div>}
         {loading && <div className="loading-line"><LoaderCircle size={15} className="spin" /> Updating your workspace…</div>}
         {page === 'dashboard' && <Dashboard user={user} incidents={incidents} tasks={tasks} openCount={openCount} overdueCount={overdueCount} completedCount={completedCount} onReport={() => setPage('report')} onOpenIncident={setSelectedIncident} onViewTasks={() => setPage('tasks')} />}
-        {page === 'report' && <ReportPage recording={isRecording} elapsed={elapsed} transcript={transcript} setTranscript={setTranscript} audioUrl={audioUrl} listeningSupported={listeningSupported} pending={pendingReport} edited={editedExtraction} setEdited={setEditedExtraction} employees={employees} assigneeId={assigneeId} setAssigneeId={setAssigneeId} onStart={() => void startRecording()} onStop={stopRecording} onSubmit={submitReport} onConfirm={confirmReport} onRetry={() => { setTranscript(''); setAudioBlob(null); setAudioUrl(''); setPendingReport(null); }} loading={loading} />}
+        {page === 'report' && <ReportPage recording={isRecording} elapsed={elapsed} transcript={transcript} setTranscript={setTranscript} language={reportLanguage} setLanguage={setReportLanguage} audioUrl={audioUrl} listeningSupported={listeningSupported} pending={pendingReport} edited={editedExtraction} setEdited={setEditedExtraction} employees={employees} assigneeId={assigneeId} setAssigneeId={setAssigneeId} onStart={() => void startRecording()} onStop={stopRecording} onSubmit={submitReport} onConfirm={confirmReport} onRetry={() => { setTranscript(''); setAudioBlob(null); setAudioUrl(''); setPendingReport(null); }} loading={loading} />}
         {page === 'reports' && <IncidentsPage incidents={filteredIncidents} search={search} setSearch={setSearch} onOpen={setSelectedIncident} />}
         {page === 'tasks' && <TasksPage tasks={tasks} onUpdate={updateTask} onOpenIncident={(id) => { const incident = incidents.find((item) => item.id === id); if (incident) setSelectedIncident(incident); }} />}
         {page === 'team' && <TeamPage employees={employees} />}
@@ -324,7 +332,7 @@ function Metric({ title, value, icon, accent, note }: { title: string; value: nu
 }
 
 function ReportPage(props: {
-  recording: boolean; elapsed: number; transcript: string; setTranscript: (value: string) => void; audioUrl: string; listeningSupported: boolean;
+  recording: boolean; elapsed: number; transcript: string; setTranscript: (value: string) => void; language: string; setLanguage: (value: string) => void; audioUrl: string; listeningSupported: boolean;
   pending: { voiceReportId: string; extraction: Extraction; clarification: string; options: Employee[] } | null;
   edited: Extraction | null; setEdited: (value: Extraction | null) => void; employees: Employee[]; assigneeId: string; setAssigneeId: (value: string) => void;
   onStart: () => void; onStop: () => void; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void; onConfirm: (event: React.FormEvent<HTMLFormElement>) => void; onRetry: () => void; loading: boolean;
@@ -346,8 +354,9 @@ function ReportPage(props: {
         <div className="confirmation-actions"><button type="button" className="secondary-button" onClick={props.onRetry}>Record again</button><button className="primary-button" disabled={props.loading}><Check size={16}/> Confirm and create task</button></div>
       </form>
     </section> : <div className="report-layout">
-      <section className="panel recorder-panel"><div className="panel-heading"><div><h2>Tell us what happened</h2><p>A short, clear description is all you need.</p></div><span className="required-label">REQUIRED</span></div>
+      <section className="panel recorder-panel"><div className="panel-heading"><div><h2>Tell us what happened</h2><p>Record up to 30 seconds. A short, clear description is all you need.</p></div><span className="required-label">REQUIRED</span></div>
         <form onSubmit={props.onSubmit}>
+          <label className="language-select">Report language<select value={props.language} onChange={(event) => props.setLanguage(event.target.value)} disabled={props.recording}><option value="hi">Hindi</option><option value="hinglish">Hinglish</option><option value="ta">Tamil</option></select></label>
           <div className={`recorder ${props.recording ? 'recording' : ''}`}>
             <div className="record-wave"><span/><span/><span/><span/><span/><span/><span/></div>
             <button type="button" className="record-button" onClick={props.recording ? props.onStop : props.onStart} aria-label={props.recording ? 'Stop recording' : 'Start recording'}>{props.recording ? <Pause size={22} fill="currentColor"/> : <Mic size={23}/>}</button>

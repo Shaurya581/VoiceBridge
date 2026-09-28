@@ -11,7 +11,11 @@ const transporter = process.env.MOCK_EMAIL === 'false'
     })
   : null;
 
-export async function sendNotification(db: DatabaseClient, input: {
+export interface NotificationProvider {
+  send(db: DatabaseClient, input: NotificationInput): Promise<Notification>;
+}
+
+export interface NotificationInput {
   kind: string;
   to: string;
   recipientId?: string | null;
@@ -19,7 +23,13 @@ export async function sendNotification(db: DatabaseClient, input: {
   body: string;
   incidentId?: string | null;
   taskId?: string | null;
-}): Promise<Notification> {
+}
+
+export class ConfiguredNotificationProvider implements NotificationProvider {
+  send(db: DatabaseClient, input: NotificationInput) { return sendNotification(db, input); }
+}
+
+export async function sendNotification(db: DatabaseClient, input: NotificationInput): Promise<Notification> {
   const record = await db.notification.create({ data: {
     kind: input.kind,
     recipientEmail: input.to,
@@ -48,4 +58,3 @@ export async function sendNotification(db: DatabaseClient, input: {
     return db.notification.update({ where: { id: record.id }, data: { status: 'FAILED', error: message } });
   }
 }
-

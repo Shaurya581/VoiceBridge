@@ -8,11 +8,15 @@ import { z } from 'zod';
 import type { Request, Response, NextFunction } from 'express';
 import type { DatabaseClient } from '../db.js';
 import { requireAuth, requireRoles } from '../auth.js';
-import { extractIncident, extractionSchema } from '../services/extraction.js';
-import { speechProvider } from '../services/speech.js';
+import { extractionSchema } from '../services/extraction.js';
+import { audioPreprocessor, speechProvider } from '../services/speech.js';
 import { ClarificationRequired, createIncidentWorkflow } from '../services/workflow.js';
 import { sendNotification } from '../services/email.js';
 import { sendTaskEscalation } from '../services/worker.js';
+import { completeTaskForVerification, recordReporterVerification } from '../services/closure.js';
+import { configuredExtractionProvider } from '../services/extraction.js';
+import { speakStatus } from '../services/voice-feedback.js';
+import { canTransitionIncident } from '../services/safety.js';
 
 const uploadDirectory = path.resolve(fileURLToPath(new URL('../../../../uploads/', import.meta.url)));
 const extensions: Record<string, string> = {
@@ -71,7 +75,8 @@ const manualIncidentSchema = z.object({
   deadline: z.string().datetime(),
   assigneeId: z.string().min(1).optional()
 });
-const taskStatusSchema = z.object({ status: z.enum(['IN_PROGRESS', 'COMPLETED', 'CLOSED']) });
+const taskStatusSchema = z.object({ status: z.enum(['IN_PROGRESS', 'COMPLETED']) });
+const languageSchema = z.enum(['hi', 'hinglish', 'ta']).default('hi');
 
 export function apiRouter(db: DatabaseClient | null) {
   const router = Router();
@@ -80,25 +85,42 @@ export function apiRouter(db: DatabaseClient | null) {
   router.post('/voice/upload', upload.single('audio'), asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
     const transcriptFromClient = typeof request.body.transcript === 'string' ? request.body.transcript.trim() : '';
+    const language = languageSchema.parse(request.body.language);
     if (!request.file && !transcriptFromClient) return response.status(400).json({ error: 'Record audio or enter a transcript before submitting.' });
     const report = await db.voiceReport.create({ data: {
       reporterId: request.user!.sub,
       audioPath: request.file ? path.relative(path.resolve(uploadDirectory, '..'), request.file.path) : null,
       audioMimeType: request.file?.mimetype ?? null,
       durationSeconds: Number.isFinite(Number(request.body.durationSeconds)) ? Number(request.body.durationSeconds) : null,
-      status: 'PROCESSING'
+      language,
+      status: 'VOICE_RECEIVED'
     } });
     try {
-      const transcription = transcriptFromClient
-        ? { transcript: transcriptFromClient, language: 'unknown', confidence: 1 }
-        : await speechProvider().transcribe(request.file!.path, request.file!.mimetype);
-      const extraction = await extractIncident(transcription.transcript);
+      await db.voiceReport.update({ where: { id: report.id }, data: { status: 'TRANSCRIBING' } });
+      const preparedAudio = request.file ? await audioPreprocessor().prepare(request.file.path) : null;
+      const rawTranscription = request.file
+        ? await speechProvider().transcribe(preparedAudio!.audioPath, request.file.mimetype, language, transcriptFromClient || undefined)
+        : { transcript: transcriptFromClient, language, confidence: null, audioQuality: 'UNKNOWN' as const };
+      const transcription = rawTranscription.audioQuality === 'UNKNOWN' && preparedAudio
+        ? { ...rawTranscription, audioQuality: preparedAudio.quality }
+        : rawTranscription;
       await db.voiceReport.update({ where: { id: report.id }, data: {
-        transcript: transcription.transcript,
+        transcript: transcription.transcript, language: transcription.language, transcriptionConfidence: transcription.confidence,
+        audioQuality: transcription.audioQuality
+      } });
+      if (transcription.confidence !== null && transcription.confidence < Number(process.env.STT_MIN_CONFIDENCE ?? 0.55)) {
+        await db.voiceReport.update({ where: { id: report.id }, data: { status: 'NEEDS_CLARIFICATION', retryCount: { increment: 1 } } });
+        await db.auditLog.create({ data: { actorId: request.user!.sub, action: 'VOICE_RETRY_REQUESTED', reason: 'Speech confidence was below the configured threshold.', metadata: { voiceReportId: report.id, confidence: transcription.confidence, audioQuality: transcription.audioQuality } } });
+        await speakStatus({ text: 'The recording was unclear. Please move closer to the microphone and say it again.', language: transcription.language, recipientId: request.user!.sub, kind: 'VOICE_RETRY_REQUEST' });
+        return response.status(202).json({ voiceReportId: report.id, transcript: transcription.transcript, confidence: transcription.confidence, audioQuality: transcription.audioQuality, retryRequired: true, message: 'The recording was unclear. Please move closer to the microphone or record again.' });
+      }
+      await db.voiceReport.update({ where: { id: report.id }, data: { status: 'EXTRACTION_PENDING' } });
+      const extraction = await configuredExtractionProvider.extract(transcription.transcript, transcription.language);
+      await db.voiceReport.update({ where: { id: report.id }, data: {
         language: transcription.language,
         transcriptionConfidence: transcription.confidence,
         extraction,
-        status: extraction.requiresConfirmation ? 'NEEDS_CLARIFICATION' : 'TRANSCRIBED'
+        status: extraction.requiresConfirmation ? 'AWAITING_CONFIRMATION' : 'SAFETY_CHECK'
       } });
       await db.auditLog.createMany({ data: [
         { actorId: request.user!.sub, action: 'VOICE_REPORT_CREATED', reason: 'Audio and transcript received.', metadata: { voiceReportId: report.id } },
@@ -106,9 +128,10 @@ export function apiRouter(db: DatabaseClient | null) {
       ] });
       try {
         const workflow = await createIncidentWorkflow(db, { reporterId: request.user!.sub, voiceReportId: report.id, extraction });
-        return response.status(201).json({ voiceReportId: report.id, transcript: transcription.transcript, extraction, incident: workflow.incident, task: workflow.task, assignedTo: workflow.assignee });
+        return response.status(201).json({ voiceReportId: report.id, transcript: transcription.transcript, extraction, incident: workflow.incident, task: workflow.task, assignedTo: workflow.assignee, duplicate: 'duplicate' in workflow ? workflow.duplicate : false, duplicateReviewPending: 'duplicateReviewPending' in workflow ? workflow.duplicateReviewPending : false });
       } catch (error) {
         if (!(error instanceof ClarificationRequired)) throw error;
+        await speakStatus({ text: error.message, language: transcription.language, recipientId: request.user!.sub, kind: 'REPORT_CLARIFICATION' });
         return response.status(202).json({ voiceReportId: report.id, transcript: transcription.transcript, extraction, requiresConfirmation: true, clarification: error.message, options: error.options });
       }
     } catch (error) {
@@ -120,7 +143,10 @@ export function apiRouter(db: DatabaseClient | null) {
   router.post('/voice/transcribe', upload.single('audio'), asyncRoute(async (request, response) => {
     if (!request.file) return response.status(400).json({ error: 'Attach a supported audio recording.' });
     try {
-      const result = await speechProvider().transcribe(request.file.path, request.file.mimetype);
+      const language = languageSchema.parse(request.body.language);
+      const prepared = await audioPreprocessor().prepare(request.file.path);
+      const transcription = await speechProvider().transcribe(prepared.audioPath, request.file.mimetype, language);
+      const result = transcription.audioQuality === 'UNKNOWN' ? { ...transcription, audioQuality: prepared.quality } : transcription;
       if (db) await db.auditLog.create({ data: { actorId: request.user!.sub, action: 'TRANSCRIPTION_COMPLETED', reason: `Speech-to-text provider returned ${result.language}.`, metadata: { confidence: result.confidence } } });
       return response.json(result);
     } finally {
@@ -155,6 +181,40 @@ export function apiRouter(db: DatabaseClient | null) {
       assignedEmployeeId: parsed.assignedEmployeeId, actorId: request.user!.sub, confirmed: true
     });
     return response.status(201).json({ incident: workflow.incident, task: workflow.task, assignedTo: workflow.assignee });
+  }));
+
+  router.post('/incidents/:id/verify-closure', asyncRoute(async (request, response) => {
+    if (!requireDb(db, response)) return;
+    const input = z.object({ response: z.enum(['1', '2']), evidenceRef: z.string().max(500).optional() }).parse(request.body);
+    try {
+      const result = await recordReporterVerification(db, routeParam(request, 'id'), request.user!.sub, input.response, input.evidenceRef);
+      return response.json(result);
+    } catch (error) {
+      if (error instanceof Error && /original reporter/.test(error.message)) return response.status(403).json({ error: error.message });
+      if (error instanceof Error && /not found/.test(error.message)) return response.status(404).json({ error: error.message });
+      if (error instanceof Error && /not awaiting|pending closure/.test(error.message)) return response.status(409).json({ error: error.message });
+      throw error;
+    }
+  }));
+
+  router.post('/incidents/:id/emergency-response', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
+    if (!requireDb(db, response)) return;
+    const incidentId = routeParam(request, 'id');
+    const incident = await db.incident.findUnique({ where: { id: incidentId }, include: { voiceReports: { orderBy: { createdAt: 'asc' }, take: 1 } } });
+    if (!incident) return response.status(404).json({ error: 'Incident not found.' });
+    if (!incident.isEmergency) return response.status(409).json({ error: 'This is not an emergency incident.' });
+    const event = await db.emergencyEvent.findFirst({ where: { incidentId, kind: 'IMMEDIATE_ALERT' }, orderBy: { triggeredAt: 'desc' } });
+    if (!event || event.respondedAt) return response.status(409).json({ error: 'No unanswered emergency alert was found.' });
+    const now = new Date();
+    await db.$transaction(async (tx) => {
+      await tx.emergencyEvent.update({ where: { id: event.id }, data: { status: 'RESPONDED', respondedAt: now } });
+      await tx.incident.update({ where: { id: incidentId }, data: { status: 'IN_PROGRESS', emergencyStatus: 'RESPONDED' } });
+      await tx.task.updateMany({ where: { incidentId, status: 'OPEN' }, data: { status: 'IN_PROGRESS' } });
+      await tx.voiceReport.updateMany({ where: { incidentId }, data: { status: 'IN_PROGRESS' } });
+      await tx.auditLog.create({ data: { actorId: request.user!.sub, incidentId, action: 'EMERGENCY_RESPONSE_RECORDED', reason: 'Authorized manager recorded emergency response.', metadata: { emergencyEventId: event.id, responseDeadline: event.responseDeadline, respondedAt: now } } });
+    });
+    await speakStatus({ text: 'A response team has acknowledged your emergency report.', language: incident.voiceReports[0]?.language ?? null, recipientId: incident.reporterId, kind: 'EMERGENCY_PROGRESS' });
+    return response.json({ incidentId, status: 'RESPONDED', responseDeadline: event.responseDeadline, respondedAt: now });
   }));
 
   router.get('/incidents', asyncRoute(async (request, response) => {
@@ -209,7 +269,7 @@ export function apiRouter(db: DatabaseClient | null) {
     if (!requireDb(db, response)) return;
     const incident = await db.incident.findUnique({ where: { id: routeParam(request, 'id') }, include: {
       reporter: { select: { id: true, name: true, email: true } },
-      voiceReport: true,
+      voiceReports: true,
       tasks: { include: { assignee: { select: { id: true, name: true, email: true, managerId: true } }, assignments: { include: { employee: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: 'desc' } }, reminders: { orderBy: { scheduledAt: 'desc' } }, escalations: { include: { manager: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: 'desc' } }, notifications: { orderBy: { createdAt: 'desc' } } } },
       notifications: { orderBy: { createdAt: 'desc' } }, auditEvents: { orderBy: { createdAt: 'asc' }, include: { actor: { select: { id: true, name: true } } } }
     } });
@@ -230,6 +290,43 @@ export function apiRouter(db: DatabaseClient | null) {
       assignee: { select: { id: true, name: true, email: true } }
     } });
     return response.json({ tasks });
+  }));
+
+  router.get('/duplicate-reviews', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
+    if (!requireDb(db, response)) return;
+    const where = request.user!.role === 'ADMIN' ? { status: 'PENDING' as const } : { status: 'PENDING' as const, candidate: { tasks: { some: { assignee: { managerId: request.user!.sub } } } } };
+    const reviews = await db.duplicateReview.findMany({ where, include: { candidate: { include: { voiceReports: true, tasks: { include: { assignee: true } } } }, existingIncident: { include: { voiceReports: true, tasks: { include: { assignee: true } } } } }, orderBy: { createdAt: 'desc' } });
+    return response.json({ reviews });
+  }));
+
+  router.patch('/duplicate-reviews/:id', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
+    if (!requireDb(db, response)) return;
+    const input = z.object({ decision: z.enum(['MERGED', 'DISTINCT']) }).parse(request.body);
+    const review = await db.duplicateReview.findUnique({ where: { id: routeParam(request, 'id') }, include: { candidate: { include: { tasks: { include: { assignee: true } } } }, existingIncident: true } });
+    if (!review || review.status !== 'PENDING') return response.status(404).json({ error: 'Pending duplicate review not found.' });
+    if (request.user!.role === 'MANAGER' && !review.candidate.tasks.some((task) => task.assignee.managerId === request.user!.sub)) return response.status(403).json({ error: 'You cannot review this duplicate match.' });
+    if (input.decision === 'MERGED') {
+      await db.$transaction(async (tx) => {
+        await tx.voiceReport.updateMany({ where: { incidentId: review.candidateId }, data: { incidentId: review.existingIncidentId } });
+        await tx.incident.update({ where: { id: review.existingIncidentId }, data: { duplicateGroupId: review.existingIncidentId } });
+        await tx.incident.update({ where: { id: review.candidateId }, data: { status: 'DUPLICATE_MERGED', duplicateGroupId: review.existingIncidentId, duplicateOfIncidentId: review.existingIncidentId, requiresConfirmation: false } });
+        await tx.task.updateMany({ where: { incidentId: review.candidateId }, data: { status: 'DUPLICATE_MERGED' } });
+        await tx.duplicateReview.update({ where: { id: review.id }, data: { status: 'MERGED', reviewedById: request.user!.sub, reviewedAt: new Date() } });
+        await tx.auditLog.createMany({ data: [
+          { actorId: request.user!.sub, incidentId: review.existingIncidentId, action: 'DUPLICATE_REPORTS_MERGED', reason: 'Manager confirmed the reports describe the same incident.', metadata: { candidateId: review.candidateId, reviewId: review.id, confidence: review.confidence } },
+          { actorId: request.user!.sub, incidentId: review.candidateId, action: 'INCIDENT_MARKED_DUPLICATE', reason: `Merged into ${review.existingIncident.incidentNumber}.`, metadata: { existingIncidentId: review.existingIncidentId, reviewId: review.id } }
+        ] });
+      });
+      return response.json({ decision: 'MERGED', incidentId: review.existingIncidentId });
+    }
+    await db.$transaction(async (tx) => {
+      await tx.duplicateReview.update({ where: { id: review.id }, data: { status: 'DISTINCT', reviewedById: request.user!.sub, reviewedAt: new Date() } });
+      await tx.incident.update({ where: { id: review.candidateId }, data: { status: 'OPEN', requiresConfirmation: false } });
+      await tx.auditLog.create({ data: { actorId: request.user!.sub, incidentId: review.candidateId, action: 'DUPLICATE_REVIEW_DISTINCT', reason: 'Manager confirmed this is a separate incident.', metadata: { reviewId: review.id, existingIncidentId: review.existingIncidentId } } });
+    });
+    const task = review.candidate.tasks[0];
+    if (task) await sendNotification(db, { kind: 'ASSIGNMENT', to: task.assignee.email, recipientId: task.assigneeId, subject: `Action required: ${review.candidate.incidentNumber}`, body: `${task.title}\n\n${task.description}`, incidentId: review.candidateId, taskId: task.id });
+    return response.json({ decision: 'DISTINCT', incidentId: review.candidateId });
   }));
 
   router.post('/tasks', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
@@ -254,37 +351,42 @@ export function apiRouter(db: DatabaseClient | null) {
   router.patch('/tasks/:id', asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
     const parsed = taskStatusSchema.parse(request.body);
-    const task = await db.task.findUnique({ where: { id: routeParam(request, 'id') }, include: { incident: true, assignee: true } });
+    const task = await db.task.findUnique({ where: { id: routeParam(request, 'id') }, include: { incident: { include: { voiceReports: { orderBy: { createdAt: 'asc' }, take: 1 } } }, assignee: true } });
     if (!task) return response.status(404).json({ error: 'Task not found.' });
     const managerAccess = request.user!.role === 'MANAGER' || request.user!.role === 'ADMIN';
     if (task.assigneeId !== request.user!.sub && !managerAccess) return response.status(403).json({ error: 'Only the assignee or a manager can update this task.' });
-    const allowed: Record<string, string[]> = { OPEN: ['IN_PROGRESS', 'COMPLETED'], IN_PROGRESS: ['COMPLETED'], OVERDUE: ['IN_PROGRESS', 'COMPLETED'], ESCALATED: ['IN_PROGRESS', 'COMPLETED'], COMPLETED: ['CLOSED'], CLOSED: [] };
+    const allowed: Record<string, string[]> = { OPEN: ['IN_PROGRESS', 'COMPLETED'], IN_PROGRESS: ['COMPLETED'], OVERDUE: ['IN_PROGRESS', 'COMPLETED'], ESCALATED: ['IN_PROGRESS', 'COMPLETED'], REOPENED: ['IN_PROGRESS', 'COMPLETED'], EMERGENCY: ['IN_PROGRESS', 'COMPLETED'] };
     if (!allowed[task.status]?.includes(parsed.status)) return response.status(409).json({ error: `Cannot move a task from ${task.status} to ${parsed.status}.` });
+    if (parsed.status === 'IN_PROGRESS' && !canTransitionIncident(task.incident.status, 'IN_PROGRESS')) return response.status(409).json({ error: `Cannot move an incident from ${task.incident.status} to IN_PROGRESS.` });
+    if (parsed.status === 'COMPLETED') {
+      const result = await completeTaskForVerification(db, task.id, request.user!.sub);
+      return response.json({ task: result.task, verification: result.verification, incidentStatus: result.incidentStatus });
+    }
     const updated = await db.$transaction(async (tx) => {
-      const newTask = await tx.task.update({ where: { id: task.id }, data: { status: parsed.status, completedAt: parsed.status === 'COMPLETED' ? new Date() : undefined } });
-      const incidentStatus = parsed.status === 'CLOSED' ? 'CLOSED' : parsed.status;
-      await tx.incident.update({ where: { id: task.incidentId }, data: { status: incidentStatus } });
-      await tx.auditLog.create({ data: { actorId: request.user!.sub, incidentId: task.incidentId, action: parsed.status === 'COMPLETED' ? 'TASK_COMPLETED' : parsed.status === 'IN_PROGRESS' ? 'TASK_STARTED' : 'INCIDENT_CLOSED', reason: 'Status updated by an authorized task owner or manager.', metadata: { taskId: task.id, status: parsed.status } } });
+      const newTask = await tx.task.update({ where: { id: task.id }, data: { status: parsed.status } });
+      await tx.incident.update({ where: { id: task.incidentId }, data: { status: parsed.status } });
+      await tx.auditLog.create({ data: { actorId: request.user!.sub, incidentId: task.incidentId, action: 'TASK_STARTED', reason: 'Status updated by an authorized task owner or manager.', metadata: { taskId: task.id, status: parsed.status } } });
       return newTask;
     });
-    if (parsed.status === 'COMPLETED') {
-      const reporter = await db.employee.findUnique({ where: { id: task.incident.reporterId } });
-      if (reporter) {
-        await sendNotification(db, { kind: 'COMPLETION', to: reporter.email, recipientId: reporter.id, subject: `Resolved: ${task.incident.incidentNumber}`, body: `Your reported issue “${task.incident.title}” has been resolved.`, incidentId: task.incidentId, taskId: task.id });
-        await db.auditLog.create({ data: { actorId: request.user!.sub, incidentId: task.incidentId, action: 'REPORTER_NOTIFIED', reason: 'The reporter was notified that the task is complete.', metadata: { taskId: task.id } } });
-      }
+    if (parsed.status === 'IN_PROGRESS') {
+      await db.voiceReport.updateMany({ where: { incidentId: task.incidentId }, data: { status: 'IN_PROGRESS' } });
+      await speakStatus({ text: 'Work on your report has started.', language: task.incident.voiceReports[0]?.language ?? null, recipientId: task.incident.reporterId, kind: 'PROGRESS_UPDATE' });
     }
     return response.json({ task: updated });
   }));
 
-  router.post('/tasks/:id/complete', (request, response, next) => {
-    request.body = { status: 'COMPLETED' };
-    next();
-  }, asyncRoute(async (request, response) => {
+  router.post('/tasks/:id/complete', asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
-    const internalRequest = request;
-    const result = await updateTaskStatus(db, internalRequest, response, 'COMPLETED');
-    return result;
+    const task = await db.task.findUnique({ where: { id: routeParam(request, 'id') } });
+    if (!task) return response.status(404).json({ error: 'Task not found.' });
+    if (task.assigneeId !== request.user!.sub && request.user!.role !== 'MANAGER' && request.user!.role !== 'ADMIN') return response.status(403).json({ error: 'Only the assignee or a manager can complete this task.' });
+    try {
+      const result = await completeTaskForVerification(db, task.id, request.user!.sub);
+      return response.json({ task: result.task, verification: result.verification, incidentStatus: result.incidentStatus });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('Cannot complete')) return response.status(409).json({ error: error.message });
+      throw error;
+    }
   }));
 
   router.post('/tasks/:id/escalate', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
@@ -357,8 +459,8 @@ export function apiRouter(db: DatabaseClient | null) {
   router.get('/analytics/overview', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (_request, response) => {
     if (!requireDb(db, response)) return;
     const [total, open, completed, overdue, escalated, byPriority] = await Promise.all([
-      db.incident.count(), db.incident.count({ where: { status: { in: ['OPEN', 'IN_PROGRESS'] } } }),
-      db.incident.count({ where: { status: 'COMPLETED' } }), db.incident.count({ where: { status: 'OVERDUE' } }),
+      db.incident.count(), db.incident.count({ where: { status: { in: ['OPEN', 'IN_PROGRESS', 'EMERGENCY', 'REOPENED', 'REPORTER_VERIFICATION_PENDING', 'AWAITING_CONFIRMATION'] } } }),
+      db.incident.count({ where: { status: 'CLOSED' } }), db.incident.count({ where: { status: 'OVERDUE' } }),
       db.incident.count({ where: { status: 'ESCALATED' } }), db.incident.groupBy({ by: ['priority'], _count: { id: true } })
     ]);
     return response.json({ total, open, completed, overdue, escalated, byPriority });
@@ -371,23 +473,4 @@ export function apiRouter(db: DatabaseClient | null) {
   }));
 
   return router;
-}
-
-async function updateTaskStatus(db: DatabaseClient, request: Request, response: Response, status: 'COMPLETED') {
-  const task = await db.task.findUnique({ where: { id: routeParam(request, 'id') }, include: { incident: true } });
-  if (!task) return response.status(404).json({ error: 'Task not found.' });
-  if (task.assigneeId !== request.user!.sub && request.user!.role !== 'MANAGER' && request.user!.role !== 'ADMIN') return response.status(403).json({ error: 'Only the assignee or a manager can complete this task.' });
-  if (!['OPEN', 'IN_PROGRESS', 'OVERDUE', 'ESCALATED'].includes(task.status)) return response.status(409).json({ error: `Cannot complete a task in ${task.status}.` });
-  const completed = await db.$transaction(async (tx) => {
-    const updated = await tx.task.update({ where: { id: task.id }, data: { status, completedAt: new Date() } });
-    await tx.incident.update({ where: { id: task.incidentId }, data: { status } });
-    await tx.auditLog.create({ data: { actorId: request.user!.sub, incidentId: task.incidentId, action: 'TASK_COMPLETED', reason: 'Task completed by an authorized owner or manager.', metadata: { taskId: task.id } } });
-    return updated;
-  });
-  const reporter = await db.employee.findUnique({ where: { id: task.incident.reporterId } });
-  if (reporter) {
-    await sendNotification(db, { kind: 'COMPLETION', to: reporter.email, recipientId: reporter.id, subject: `Resolved: ${task.incident.incidentNumber}`, body: `Your reported issue “${task.incident.title}” has been resolved.`, incidentId: task.incidentId, taskId: task.id });
-    await db.auditLog.create({ data: { actorId: request.user!.sub, incidentId: task.incidentId, action: 'REPORTER_NOTIFIED', reason: 'The reporter was notified that the task is complete.', metadata: { taskId: task.id } } });
-  }
-  return response.json({ task: completed });
 }

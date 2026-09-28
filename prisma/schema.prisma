@@ -24,9 +24,18 @@ enum WorkflowStatus {
   OPEN
   IN_PROGRESS
   COMPLETED
+  COMPLETED_BY_ASSIGNEE
   OVERDUE
   ESCALATED
   CLOSED
+  REPORTER_VERIFICATION_PENDING
+  REPORTER_CONFIRMED
+  REPORTER_REJECTED
+  REOPENED
+  EMERGENCY
+  AWAITING_CONFIRMATION
+  ASSIGNED
+  DUPLICATE_MERGED
 }
 
 enum VoiceReportStatus {
@@ -36,6 +45,43 @@ enum VoiceReportStatus {
   NEEDS_CLARIFICATION
   PROCESSED
   FAILED
+  VOICE_RECEIVED
+  TRANSCRIBING
+  EXTRACTION_PENDING
+  AWAITING_CONFIRMATION
+  SAFETY_CHECK
+  DUPLICATE_CHECK
+  ASSIGNMENT_PENDING
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED_BY_ASSIGNEE
+  REPORTER_VERIFICATION_PENDING
+  REPORTER_CONFIRMED
+  REPORTER_REJECTED
+  REOPENED
+  OVERDUE
+  ESCALATED
+  CLOSED
+  EMERGENCY
+}
+
+enum AudioQuality {
+  CLEAN
+  NOISY
+  UNKNOWN
+}
+
+enum VerificationStatus {
+  PENDING
+  CONFIRMED
+  REJECTED
+  EXPIRED
+}
+
+enum DuplicateReviewStatus {
+  PENDING
+  MERGED
+  DISTINCT
 }
 
 enum DeliveryStatus {
@@ -68,6 +114,7 @@ model Employee {
   manager            Employee?      @relation("EmployeeManager", fields: [managerId], references: [id], onDelete: SetNull)
   directReports      Employee[]     @relation("EmployeeManager")
   voiceReports       VoiceReport[]
+  closureVerifications ClosureVerification[]
   reportedIncidents  Incident[]     @relation("IncidentReporter")
   assignedTasks      Task[]         @relation("TaskAssignee")
   createdTasks       Task[]         @relation("TaskCreator")
@@ -93,14 +140,18 @@ model VoiceReport {
   transcript       String?
   language         String?
   transcriptionConfidence Float?
+  audioQuality     AudioQuality @default(UNKNOWN)
+  retryCount       Int          @default(0)
   extraction       Json?
   status           VoiceReportStatus @default(RECEIVED)
-  incident         Incident?
+  incidentId       String?
+  incident         Incident?   @relation(fields: [incidentId], references: [id], onDelete: SetNull)
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
 
   @@index([reporterId, createdAt])
   @@index([status, createdAt])
+  @@index([incidentId, createdAt])
 }
 
 model Incident {
@@ -116,6 +167,18 @@ model Incident {
   responsiblePerson   String?
   priority            Priority       @default(MEDIUM)
   status              WorkflowStatus @default(OPEN)
+  isEmergency         Boolean        @default(false)
+  emergencyStatus     String?
+  duplicateGroupId    String?
+  duplicateOfIncidentId String?
+  duplicateOfIncident Incident? @relation("IncidentDuplicate", fields: [duplicateOfIncidentId], references: [id], onDelete: SetNull)
+  duplicateIncidents Incident[] @relation("IncidentDuplicate")
+  duplicateReviews    DuplicateReview[] @relation("DuplicateCandidate")
+  duplicateOfReviews  DuplicateReview[] @relation("DuplicateExisting")
+  reporterVerificationStatus VerificationStatus?
+  reporterVerifiedAt  DateTime?
+  reopenedAt          DateTime?
+  reopenReason        String?
   confidence          Float?
   extractedData       Json?
   missingInformation  String[]       @default([])
@@ -123,9 +186,10 @@ model Incident {
   deadline            DateTime
   reporterId          String
   reporter            Employee       @relation("IncidentReporter", fields: [reporterId], references: [id], onDelete: Restrict)
-  voiceReportId       String?        @unique
-  voiceReport         VoiceReport?   @relation(fields: [voiceReportId], references: [id], onDelete: SetNull)
+  voiceReports        VoiceReport[]
   tasks               Task[]
+  closureVerifications ClosureVerification[]
+  emergencyEvents     EmergencyEvent[]
   notifications       Notification[]
   auditEvents         AuditLog[]
   createdAt           DateTime       @default(now())
@@ -135,6 +199,58 @@ model Incident {
   @@index([responsibleDepartment, status])
   @@index([reporterId, createdAt])
   @@index([deadline, status])
+}
+
+model ClosureVerification {
+  id             String             @id @default(cuid())
+  incidentId     String
+  incident       Incident           @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  reporterId     String
+  reporter       Employee           @relation(fields: [reporterId], references: [id], onDelete: Restrict)
+  status         VerificationStatus @default(PENDING)
+  response       String?
+  attemptNumber  Int                @default(1)
+  evidenceRef    String?
+  requestedAt    DateTime           @default(now())
+  respondedAt    DateTime?
+  createdAt      DateTime           @default(now())
+
+  @@index([incidentId, requestedAt])
+  @@index([reporterId, status])
+}
+
+model EmergencyEvent {
+  id          String   @id @default(cuid())
+  incidentId  String
+  incident    Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  kind        String
+  status      String   @default("PENDING")
+  reason      String
+  triggeredAt DateTime @default(now())
+  alertedAt   DateTime?
+  responseDeadline DateTime?
+  respondedAt DateTime?
+  metadata    Json?
+
+  @@index([incidentId, triggeredAt])
+  @@index([status, triggeredAt])
+}
+
+model DuplicateReview {
+  id                String               @id @default(cuid())
+  candidateId       String
+  candidate         Incident             @relation("DuplicateCandidate", fields: [candidateId], references: [id], onDelete: Cascade)
+  existingIncidentId String
+  existingIncident  Incident             @relation("DuplicateExisting", fields: [existingIncidentId], references: [id], onDelete: Cascade)
+  confidence        Float
+  status            DuplicateReviewStatus @default(PENDING)
+  reason            String
+  reviewedById      String?
+  reviewedAt        DateTime?
+  createdAt         DateTime             @default(now())
+
+  @@unique([candidateId, existingIncidentId])
+  @@index([status, createdAt])
 }
 
 model Task {

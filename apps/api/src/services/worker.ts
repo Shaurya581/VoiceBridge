@@ -16,6 +16,7 @@ export async function sendTaskEscalation(db: DatabaseClient, taskId: string, rea
     }
   });
   if (!task) throw new Error('Task not found');
+  if (task.incident.isEmergency) throw new Error('Emergency incidents bypass normal escalation');
   if (['COMPLETED', 'CLOSED'].includes(task.status)) throw new Error('Completed tasks cannot be escalated');
   const manager = task.assignee.manager ?? task.assignee.department?.employees.find((candidate) => candidate.id !== task.assigneeId);
   if (!manager) throw new Error('No manager is configured for this task');
@@ -41,7 +42,7 @@ export async function runDeadlineSweep(db: DatabaseClient, now = new Date()) {
     orderBy: { scheduledAt: 'asc' }, take: 100
   });
   for (const reminder of dueReminders) {
-    if (['COMPLETED', 'CLOSED'].includes(reminder.task.status)) {
+    if (reminder.task.incident.isEmergency || ['COMPLETED', 'CLOSED'].includes(reminder.task.status)) {
       await db.reminder.update({ where: { id: reminder.id }, data: { status: 'FAILED' } });
       continue;
     }
@@ -58,7 +59,7 @@ export async function runDeadlineSweep(db: DatabaseClient, now = new Date()) {
   }
 
   const overdue = await db.task.findMany({
-    where: { status: { in: ['OPEN', 'IN_PROGRESS'] }, deadline: { lt: now } },
+    where: { status: { in: ['OPEN', 'IN_PROGRESS'] }, deadline: { lt: now }, incident: { isEmergency: false } },
     include: { incident: true }
   });
   for (const task of overdue) {
@@ -70,7 +71,7 @@ export async function runDeadlineSweep(db: DatabaseClient, now = new Date()) {
   }
 
   const eligible = await db.task.findMany({
-    where: { status: 'OVERDUE', deadline: { lt: now } },
+    where: { status: 'OVERDUE', deadline: { lt: now }, incident: { isEmergency: false } },
     include: { incident: true, escalations: true }
   });
   for (const task of eligible) {
