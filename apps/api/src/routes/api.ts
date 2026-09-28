@@ -17,6 +17,7 @@ import { completeTaskForVerification, recordReporterVerification } from '../serv
 import { configuredExtractionProvider } from '../services/extraction.js';
 import { speakStatus } from '../services/voice-feedback.js';
 import { canTransitionIncident } from '../services/safety.js';
+import { canonicalAudioMimeType, validateAudioFile } from '../services/audio-validation.js';
 
 const uploadDirectory = path.resolve(fileURLToPath(new URL('../../../../uploads/', import.meta.url)));
 const extensions: Record<string, string> = {
@@ -30,10 +31,10 @@ const upload = multer({
         .then(() => callback(null, uploadDirectory))
         .catch((error: Error) => callback(error, uploadDirectory));
     },
-    filename: (_request, file, callback) => callback(null, `${randomUUID()}${extensions[file.mimetype] ?? '.audio'}`)
+    filename: (_request, file, callback) => callback(null, `${randomUUID()}${extensions[canonicalAudioMimeType(file.mimetype)] ?? '.audio'}`)
   }),
   limits: { fileSize: 25 * 1024 * 1024, files: 1 },
-  fileFilter: (_request, file, callback) => callback(null, Boolean(extensions[file.mimetype]))
+  fileFilter: (_request, file, callback) => callback(null, Boolean(extensions[canonicalAudioMimeType(file.mimetype)]))
 });
 
 function requireDb(db: DatabaseClient | null, response: Response): db is DatabaseClient {
@@ -96,11 +97,21 @@ export function apiRouter(db: DatabaseClient | null) {
     const transcriptFromClient = typeof request.body.transcript === 'string' ? request.body.transcript.trim() : '';
     const language = languageSchema.parse(request.body.language);
     if (!request.file && !transcriptFromClient) return response.status(400).json({ error: 'Record audio or enter a transcript before submitting.' });
+    const suppliedDuration = request.body.durationSeconds;
+    const durationSeconds = suppliedDuration === undefined || suppliedDuration === '' ? null : Number(suppliedDuration);
+    if (durationSeconds !== null && (!Number.isFinite(durationSeconds) || durationSeconds < 0 || durationSeconds > 30)) {
+      if (request.file) await unlink(request.file.path).catch(() => undefined);
+      return response.status(400).json({ error: 'Voice reports must be 30 seconds or shorter.' });
+    }
+    if (request.file && !(await validateAudioFile(request.file.path, request.file.mimetype))) {
+      await unlink(request.file.path).catch(() => undefined);
+      return response.status(415).json({ error: 'The uploaded file does not match a supported audio format.' });
+    }
     const report = await db.voiceReport.create({ data: {
       reporterId: request.user!.sub,
       audioPath: request.file ? path.relative(path.resolve(uploadDirectory, '..'), request.file.path) : null,
-      audioMimeType: request.file?.mimetype ?? null,
-      durationSeconds: Number.isFinite(Number(request.body.durationSeconds)) ? Number(request.body.durationSeconds) : null,
+      audioMimeType: request.file ? canonicalAudioMimeType(request.file.mimetype) : null,
+      durationSeconds,
       language,
       status: 'VOICE_RECEIVED'
     } });
@@ -108,7 +119,7 @@ export function apiRouter(db: DatabaseClient | null) {
       await db.voiceReport.update({ where: { id: report.id }, data: { status: 'TRANSCRIBING' } });
       const preparedAudio = request.file ? await audioPreprocessor().prepare(request.file.path) : null;
       const rawTranscription = request.file
-        ? await speechProvider().transcribe(preparedAudio!.audioPath, request.file.mimetype, language, transcriptFromClient || undefined)
+        ? await speechProvider().transcribe(preparedAudio!.audioPath, canonicalAudioMimeType(request.file.mimetype), language, transcriptFromClient || undefined)
         : { transcript: transcriptFromClient, language, confidence: null, audioQuality: 'UNKNOWN' as const };
       const transcription = rawTranscription.audioQuality === 'UNKNOWN' && preparedAudio
         ? { ...rawTranscription, audioQuality: preparedAudio.quality }
@@ -152,9 +163,10 @@ export function apiRouter(db: DatabaseClient | null) {
   router.post('/voice/transcribe', upload.single('audio'), asyncRoute(async (request, response) => {
     if (!request.file) return response.status(400).json({ error: 'Attach a supported audio recording.' });
     try {
+      if (!(await validateAudioFile(request.file.path, request.file.mimetype))) return response.status(415).json({ error: 'The uploaded file does not match a supported audio format.' });
       const language = languageSchema.parse(request.body.language);
       const prepared = await audioPreprocessor().prepare(request.file.path);
-      const transcription = await speechProvider().transcribe(prepared.audioPath, request.file.mimetype, language);
+      const transcription = await speechProvider().transcribe(prepared.audioPath, canonicalAudioMimeType(request.file.mimetype), language);
       const result = transcription.audioQuality === 'UNKNOWN' ? { ...transcription, audioQuality: prepared.quality } : transcription;
       if (db) await db.auditLog.create({ data: { actorId: request.user!.sub, action: 'TRANSCRIPTION_COMPLETED', reason: `Speech-to-text provider returned ${result.language}.`, metadata: { confidence: result.confidence } } });
       return response.json(result);

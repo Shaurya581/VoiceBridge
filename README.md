@@ -8,6 +8,7 @@ VoiceBridge is a student MVP foundation for spoken frontline incident reporting.
 
 - React/TypeScript dashboard, authenticated API, role checks, incident/task routes, and audit history.
 - Voice report persistence for Hindi, Hinglish, and Tamil selections, with transcript, original audio reference, confidence, audio-quality label, and extracted JSON fields.
+- Push-to-talk capture is capped at 30 seconds in the browser. API uploads have a 25 MiB limit, normalize browser MIME codec parameters, and check the basic file signature against the declared audio container.
 - Deterministic safety keyword check before assignment workflow, with English, Hindi, Hinglish, and Tamil terms. Emergency reports are marked critical, create a timed emergency event, receive immediate mock spoken acknowledgement and mock alert, and skip normal reminder/escalation processing.
 - Duplicate foundations: high-confidence same-asset/issue matches attach a report to an existing incident; uncertain matches are recorded for manager review. Original recordings/reports remain preserved.
 - Assignee completion creates a reporter-verification request. Only the original reporter can confirm or reject; confirmation closes the incident and rejection reopens it.
@@ -28,6 +29,7 @@ VoiceBridge is a student MVP foundation for spoken frontline incident reporting.
 - Downloading/configuring IndicWhisper model checkpoints and verifying real inference, Hindi/Tamil TTS, a real telephony provider, VAD/noise suppression, labeled multilingual/noisy evaluation data, and measured quality/latency results.
 - The proposal’s evaluation targets are goals to measure, not achieved results.
 - The current browser speech API and mock providers do not establish production-grade multilingual speech recognition.
+- The main Node API checks the client-declared recording duration but does not decode uploaded media to independently measure duration. The optional IndicWhisper wrapper uses `ffprobe` for that check.
 - Local Ollama extraction requires a separately installed Ollama runtime/model; no LLM weights are bundled or downloaded.
 - The Ollama extraction adapter has not been run against a model or measured on held-out multilingual transcripts.
 
