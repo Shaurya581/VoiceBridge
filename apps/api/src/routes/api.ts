@@ -206,14 +206,14 @@ export function apiRouter(db: DatabaseClient | null) {
 
   router.post('/incidents/:id/verify-closure', asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
-    const input = z.object({ response: z.enum(['1', '2']), evidenceRef: z.string().max(500).optional() }).parse(request.body);
+    const input = z.object({ verificationId: z.string().min(1).max(100), response: z.unknown().optional(), evidenceRef: z.string().max(500).optional() }).parse(request.body);
     try {
-      const result = await recordReporterVerification(db, routeParam(request, 'id'), request.user!.sub, input.response, input.evidenceRef);
+      const result = await recordReporterVerification(db, input.verificationId, request.user!.sub, input.response, input.evidenceRef, new Date(), {}, routeParam(request, 'id'));
       return response.json(result);
     } catch (error) {
       if (error instanceof Error && /original reporter/.test(error.message)) return response.status(403).json({ error: error.message });
-      if (error instanceof Error && /not found/.test(error.message)) return response.status(404).json({ error: error.message });
-      if (error instanceof Error && /not awaiting|pending closure/.test(error.message)) return response.status(409).json({ error: error.message });
+      if (error instanceof Error && /not found|does not belong/.test(error.message)) return response.status(404).json({ error: error.message });
+      if (error instanceof Error && /not awaiting/.test(error.message)) return response.status(409).json({ error: error.message });
       throw error;
     }
   }));
@@ -384,8 +384,13 @@ export function apiRouter(db: DatabaseClient | null) {
     if (!allowed[task.status]?.includes(parsed.status)) return response.status(409).json({ error: `Cannot move a task from ${task.status} to ${parsed.status}.` });
     if (parsed.status === 'IN_PROGRESS' && !canTransitionIncident(task.incident.status, 'IN_PROGRESS')) return response.status(409).json({ error: `Cannot move an incident from ${task.incident.status} to IN_PROGRESS.` });
     if (parsed.status === 'COMPLETED') {
-      const result = await completeTaskForVerification(db, task.id, request.user!.sub);
-      return response.json({ task: result.task, verification: result.verification, incidentStatus: result.incidentStatus });
+      try {
+        const result = await completeTaskForVerification(db, task.id, request.user!.sub);
+        return response.json({ task: result.task, verification: result.verification, incidentStatus: result.incidentStatus });
+      } catch (error) {
+        if (error instanceof Error && /Cannot complete|Cannot verify completion|Cannot request verification/u.test(error.message)) return response.status(409).json({ error: error.message });
+        throw error;
+      }
     }
     const updated = await db.$transaction(async (tx) => {
       const newTask = await tx.task.update({ where: { id: task.id }, data: { status: parsed.status } });
@@ -410,7 +415,7 @@ export function apiRouter(db: DatabaseClient | null) {
       const result = await completeTaskForVerification(db, task.id, request.user!.sub);
       return response.json({ task: result.task, verification: result.verification, incidentStatus: result.incidentStatus });
     } catch (error) {
-      if (error instanceof Error && error.message.includes('Cannot complete')) return response.status(409).json({ error: error.message });
+      if (error instanceof Error && /Cannot complete|Cannot verify completion|Cannot request verification/u.test(error.message)) return response.status(409).json({ error: error.message });
       throw error;
     }
   }));

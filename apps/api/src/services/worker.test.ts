@@ -27,6 +27,7 @@ function fakeDb(overrides: Record<string, unknown> = {}) {
   const tx = {
     reminder: { update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     emergencyEvent: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    closureVerification: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     task: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     incident: { update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     voiceReport: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
@@ -36,9 +37,11 @@ function fakeDb(overrides: Record<string, unknown> = {}) {
   const db = {
     reminder: { updateMany: vi.fn().mockResolvedValue({ count: 0 }), findMany: vi.fn().mockResolvedValue([]) },
     emergencyEvent: { updateMany: vi.fn().mockResolvedValue({ count: 0 }), findMany: vi.fn().mockResolvedValue([]), findUnique: vi.fn() },
+    closureVerification: { updateMany: vi.fn().mockResolvedValue({ count: 0 }), findMany: vi.fn().mockResolvedValue([]), findUnique: vi.fn() },
     task: { findMany: vi.fn().mockResolvedValue([]), findUnique: vi.fn(), updateMany: vi.fn() },
     incident: { update: vi.fn(), updateMany: vi.fn() },
     employee: { findUnique: vi.fn().mockResolvedValue(null) },
+    auditLog: { create: vi.fn().mockResolvedValue({}) },
     voiceReport: { updateMany: vi.fn() },
     escalationRule: { findMany: vi.fn().mockResolvedValue([]) },
     $transaction: vi.fn((callback: (client: typeof tx) => unknown) => callback(tx)),
@@ -183,6 +186,27 @@ describe('Phase 6 workflow automation', () => {
     expect(tx.emergencyEvent.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'SIMULATED', alertedAt: now } }));
     expect(tx.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ action: 'EMERGENCY_ALERT_DISPATCHED' }) }));
     expect(tx.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ action: 'EMERGENCY_REMINDER_BYPASSED' }) }));
+  });
+
+  it('retries pending reporter requests from the existing background worker', async () => {
+    const verification = {
+      id: 'verification-1', incidentId: 'incident-1', reporterId: 'reporter-1', status: 'PENDING', deliveryStatus: 'FAILED', attemptCount: 1,
+      language: 'ta', prompt: 'தமிழ் prompt', incident: { id: 'incident-1', reporterId: 'reporter-1', status: 'REPORTER_VERIFICATION_PENDING' }
+    };
+    const { db, tx, raw } = fakeDb();
+    raw.closureVerification.findMany = vi.fn().mockResolvedValue([verification]);
+    raw.closureVerification.findUnique = vi.fn().mockResolvedValue(verification);
+    raw.closureVerification.updateMany = vi.fn().mockResolvedValue({ count: 0 });
+    const tts = { speak: vi.fn().mockResolvedValue(undefined) };
+    const ivr = { call: vi.fn().mockResolvedValue({ status: 'SIMULATED' }) };
+
+    const result = await runDeadlineSweep(db, now, { closureFeedback: { tts, ivr } });
+
+    expect(result.closureRequestsSent).toBe(1);
+    expect(tts.speak).toHaveBeenCalledWith(expect.objectContaining({ recipientId: 'reporter-1', language: 'ta', text: 'தமிழ் prompt' }));
+    expect(ivr.call).toHaveBeenCalledWith(expect.objectContaining({ verificationId: 'verification-1', recipientId: 'reporter-1', language: 'ta' }));
+    expect(tx.closureVerification.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { deliveryStatus: 'SENT' } }));
+    expect(tx.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ action: 'CLOSURE_NOTIFICATION_SENT' }) }));
   });
 
   it('does not invoke emergency or normal escalation without a valid deadline', async () => {

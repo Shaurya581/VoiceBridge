@@ -3,6 +3,8 @@ import { notificationProvider, type NotificationProvider } from './email.js';
 import { dispatchEmergencyAlert } from './emergency-alerts.js';
 import { canTransitionIncident } from './safety.js';
 import type { EmergencyAlertProvider } from './voice-feedback.js';
+import type { IVRProvider, TTSProvider } from './voice-feedback.js';
+import { dispatchClosureVerification } from './closure.js';
 import { isValidDeadline, selectEscalationPolicy } from './workflow-policy.js';
 
 const maxReminderAttempts = () => {
@@ -12,6 +14,11 @@ const maxReminderAttempts = () => {
 
 const maxEmergencyAlertAttempts = () => {
   const configured = Number(process.env.EMERGENCY_ALERT_MAX_ATTEMPTS ?? 3);
+  return Number.isInteger(configured) && configured > 0 ? configured : 3;
+};
+
+const maxClosureVerificationAttempts = () => {
+  const configured = Number(process.env.CLOSURE_VERIFICATION_MAX_ATTEMPTS ?? 3);
   return Number.isInteger(configured) && configured > 0 ? configured : 3;
 };
 
@@ -104,7 +111,7 @@ export async function sendTaskEscalation(
 export async function runDeadlineSweep(
   db: DatabaseClient,
   now = new Date(),
-  dependencies: { notifications?: NotificationProvider; emergencyAlerts?: EmergencyAlertProvider } = {}
+  dependencies: { notifications?: NotificationProvider; emergencyAlerts?: EmergencyAlertProvider; closureFeedback?: { tts?: TTSProvider; ivr?: IVRProvider } } = {}
 ) {
   const notifications = dependencies.notifications ?? notificationProvider();
   const emergencyAlerts = dependencies.emergencyAlerts;
@@ -114,6 +121,8 @@ export async function runDeadlineSweep(
   let tasksEscalated = 0;
   let emergencyAlertsAttempted = 0;
   let emergencyAlertsFailed = 0;
+  let closureRequestsSent = 0;
+  let closureRequestsFailed = 0;
 
   await db.reminder.updateMany({
     where: { status: 'PROCESSING', lastAttemptAt: { lt: leaseCutoff(now) } },
@@ -122,6 +131,10 @@ export async function runDeadlineSweep(
   await db.emergencyEvent.updateMany({
     where: { status: 'PROCESSING', lastAttemptAt: { lt: leaseCutoff(now) } },
     data: { status: 'FAILED' }
+  });
+  await db.closureVerification.updateMany({
+    where: { deliveryStatus: 'PROCESSING', lastAttemptAt: { lt: leaseCutoff(now) } },
+    data: { deliveryStatus: 'FAILED' }
   });
 
   const pendingAlerts = await db.emergencyEvent.findMany({
@@ -139,6 +152,21 @@ export async function runDeadlineSweep(
     }
   }
 
+  const pendingClosureRequests = await db.closureVerification.findMany({
+    where: { status: 'PENDING', deliveryStatus: { in: ['PENDING', 'FAILED'] }, attemptCount: { lt: maxClosureVerificationAttempts() } },
+    orderBy: { requestedAt: 'asc' }, take: 100
+  });
+  for (const verification of pendingClosureRequests) {
+    try {
+      const result = await dispatchClosureVerification(db, verification.id, now, dependencies.closureFeedback);
+      if (result.attempted && result.delivered) closureRequestsSent += 1;
+      if (result.attempted && !result.delivered) closureRequestsFailed += 1;
+    } catch (error) {
+      closureRequestsFailed += 1;
+      console.error(JSON.stringify({ event: 'closure_verification_delivery_failed', verificationId: verification.id, message: error instanceof Error ? error.message : 'unknown error' }));
+    }
+  }
+
   const dueReminders = await db.reminder.findMany({
     where: { status: { in: ['PENDING', 'FAILED'] }, attemptCount: { lt: maxReminderAttempts() }, scheduledAt: { lte: now } },
     include: { task: { include: { incident: true, assignee: true } } },
@@ -148,7 +176,7 @@ export async function runDeadlineSweep(
     const task = reminder.task;
     const skipReason = task.incident.isEmergency || task.incident.status === 'EMERGENCY'
       ? 'Emergency incidents bypass normal reminders.'
-      : ['COMPLETED', 'CLOSED', 'ESCALATED', 'OVERDUE'].includes(task.status)
+      : ['COMPLETED', 'COMPLETED_BY_ASSIGNEE', 'CLOSED', 'ESCALATED', 'OVERDUE'].includes(task.status)
         ? `Task is already ${task.status.toLocaleLowerCase()}.`
         : !isValidDeadline(task.deadline)
           ? 'Task has no valid configured deadline.'
@@ -246,7 +274,7 @@ export async function runDeadlineSweep(
       console.error(JSON.stringify({ event: 'escalation_failed', taskId: task.id, message: error instanceof Error ? error.message : 'unknown error' }));
     }
   }
-  return { remindersSent, remindersFailed, tasksOverdue, tasksEscalated, emergencyAlertsAttempted, emergencyAlertsFailed };
+  return { remindersSent, remindersFailed, tasksOverdue, tasksEscalated, emergencyAlertsAttempted, emergencyAlertsFailed, closureRequestsSent, closureRequestsFailed };
 }
 
 export function startDeadlineWorker(db: DatabaseClient, intervalMs = 60_000) {

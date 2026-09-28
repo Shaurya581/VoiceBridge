@@ -77,8 +77,8 @@ const openApiDocument = {
     '/api/voice/upload': { post: { summary: 'Submit audio and transcript', security: [{ bearerAuth: [] }], responses: { '201': { description: 'Incident and task created' }, '202': { description: 'Human confirmation required' } } } },
     '/api/incidents': { get: { summary: 'List incidents visible to the current user', security: [{ bearerAuth: [] }], responses: { '200': { description: 'Incident list' } } } },
     '/api/tasks': { get: { summary: 'List tasks visible to the current user', security: [{ bearerAuth: [] }], responses: { '200': { description: 'Task list' } } } },
-    '/api/tasks/{id}/complete': { post: { summary: 'Complete a task and notify the reporter', security: [{ bearerAuth: [] }], responses: { '200': { description: 'Task completed' } } } }
+    '/api/tasks/{id}/complete': { post: { summary: 'Complete a task and request spoken reporter verification', security: [{ bearerAuth: [] }], responses: { '200': { description: 'Task completion recorded; incident awaits reporter verification' } } } },
+    '/api/incidents/{id}/verify-closure': { post: { summary: 'Record the original reporter response for a specific verification request', security: [{ bearerAuth: [] }], responses: { '200': { description: 'Verification recorded; incident closed or reopened' }, '403': { description: 'Only the original reporter may respond' }, '404': { description: 'Verification request not found for this incident' } } } }
   },
   components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } } }
 };
-

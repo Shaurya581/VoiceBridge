@@ -1,5 +1,6 @@
 import { createDatabase } from '../apps/api/src/db.js';
 import { hashPassword } from '../apps/api/src/auth.js';
+import { buildClosurePrompt } from '../apps/api/src/services/closure.js';
 
 const database = createDatabase();
 if (!database) throw new Error('DATABASE_URL is required to seed VoiceBridge.');
@@ -102,7 +103,7 @@ for (let index = 0; index < scenarios.length; index += 1) {
   const task = await db.task.create({ data: {
     title: incident.requestedAction ?? scenario.issue,
     description: incident.description,
-    status: scenario.status,
+    status: scenario.status === 'COMPLETED' ? 'COMPLETED_BY_ASSIGNEE' : scenario.status,
     deadline: due,
     incidentId: incident.id,
     assigneeId,
@@ -110,7 +111,18 @@ for (let index = 0; index < scenarios.length; index += 1) {
     completedAt: scenario.status === 'COMPLETED' ? new Date(due.getTime() + 30 * 60_000) : null
   } });
   await db.assignment.create({ data: { taskId: task.id, employeeId: assigneeId, assignedById: reporterId, reason: `Seeded ${scenario.department} responsibility mapping`, confidence: 0.92 } });
-  if (scenario.status === 'COMPLETED') await db.closureVerification.create({ data: { incidentId: incident.id, reporterId, attemptNumber: 1 } });
+  if (scenario.status === 'COMPLETED') {
+    const taskCompletedAt = task.completedAt ?? new Date();
+    const verification = await db.closureVerification.create({ data: {
+      incidentId: incident.id, reporterId, attemptNumber: 1, taskCompletedAt, language: 'hi',
+      prompt: buildClosurePrompt({ asset: incident.asset, title: incident.title }, 'hi'),
+      deliveryMode: 'MOCK', deliveryStatus: 'PENDING'
+    } });
+    await db.auditLog.createMany({ data: [
+      { actorId: assigneeId, incidentId: incident.id, action: 'TASK_COMPLETED_BY_ASSIGNEE', reason: 'Seeded demonstration task awaits reporter verification.', metadata: { taskId: task.id, verificationId: verification.id, completedAt: taskCompletedAt.toISOString() } },
+      { actorId: null, incidentId: incident.id, action: 'REPORTER_VERIFICATION_REQUESTED', reason: 'Seeded spoken verification request for the original reporter.', metadata: { taskId: task.id, verificationId: verification.id, reporterId, language: 'hi', prompt: verification.prompt } }
+    ] });
+  }
   await db.reminder.create({ data: { taskId: task.id, scheduledAt: new Date(Math.max(now.getTime(), due.getTime() - 60 * 60_000)), status: scenario.status === 'COMPLETED' ? 'FAILED' : 'PENDING' } });
   if (scenario.status === 'ESCALATED') {
     await db.escalation.create({ data: { taskId: task.id, managerId: managers.get(scenario.department)!, reason: 'Seeded overdue escalation.', level: 1 } });

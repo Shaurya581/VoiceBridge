@@ -21,7 +21,7 @@ VoiceBridge is a student MVP foundation for spoken frontline incident reporting.
 
 - Speech recognition defaults to a mock. OpenAI Whisper is an optional adapter; IndicWhisper is an optional adapter to a configured endpoint. Neither provider has been run against this project's recordings or measured against the proposal targets.
 - Extraction defaults to deterministic mock rules. Optional OpenAI and local Ollama structured-output adapters are available; both outputs pass backend Zod validation and deterministic safety/confirmation rules before workflow code can act.
-- TTS, IVR calls, and emergency alerts are mock providers that log simulated actions. `MOCK_IVR_RESPONSE=1` or `2` can simulate a closure response; leave it blank to collect a reporter response through the API.
+- TTS, IVR calls, and emergency alerts are mock providers that log simulated actions. `MOCK_IVR_RESPONSE=1` or `2` can simulate a closure response; leave it blank to keep reporter verification pending. An authenticated original reporter can respond through `POST /api/incidents/{incidentId}/verify-closure` using the `verificationId` returned when the task is completed. No real voice call is placed.
 - Email defaults to recorded mock delivery.
 
 ### Planned / not yet verified
@@ -51,7 +51,7 @@ pnpm --filter @voicebridge/api seed
 pnpm dev
 ```
 
-Docker Compose configuration is provided, but Docker/database startup has not been verified in the current environment. Direct provider integrations require their corresponding credentials and are outside the all-mock default.
+Docker Compose configuration is provided, but Docker/database startup has not been verified in the current environment. **Live PostgreSQL integration remains unverified.** Direct provider integrations require their corresponding credentials and are outside the all-mock default.
 
 To run the included local wrapper, follow [`apps/api/indicwhisper/README.md`](apps/api/indicwhisper/README.md). Then set `STT_PROVIDER=indicwhisper` and `INDICWHISPER_ENDPOINT=http://127.0.0.1:8010/transcribe`. The wrapper expects local Hindi and Tamil checkpoints configured separately; Hinglish uses the Hindi checkpoint. The endpoint returns JSON `{ "text": "...", "language": "hi" }`; confidence remains unknown because IndicWhisper's documented inference returns text without a calibrated confidence score. AI4Bharat documents model downloads and Transformers inference in its [Vistaar repository](https://github.com/AI4Bharat/vistaar#inference-using-indicwhisper), not an HTTP contract, so this project includes a thin local wrapper. Keep it bound to localhost unless you configure its API key.
 
@@ -64,6 +64,8 @@ pnpm typecheck
 pnpm build
 pnpm test
 ```
+
+The suite includes deterministic Phase 8 acceptance scenarios covering a mock Hinglish report through assignment, reminder, escalation, assignee completion, and reporter-confirmed closure, plus a mock gas-leak alert. These use in-memory database doubles; they do not replace PostgreSQL integration testing.
 
 STT result evaluation accepts JSON Lines containing one sample per line:
 

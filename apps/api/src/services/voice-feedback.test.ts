@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ivrProvider, normalizeLanguage, textToSpeechProvider } from './voice-feedback.js';
+import { ivrProvider, normalizeLanguage, textToSpeechProvider, MockIVRProvider, MockTextToSpeechProvider } from './voice-feedback.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -19,8 +19,13 @@ describe('mock spoken-feedback providers', () => {
     log.mockRestore();
   });
 
-  it('does not silently claim real provider support', () => {
+  it('falls back to explicit mocks when real speech providers are unavailable', () => {
     vi.stubEnv('MOCK_TTS', 'false');
-    expect(() => textToSpeechProvider()).toThrow(/not configured/);
+    vi.stubEnv('MOCK_IVR', 'false');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect(textToSpeechProvider()).toBeInstanceOf(MockTextToSpeechProvider);
+    expect(ivrProvider()).toBeInstanceOf(MockIVRProvider);
+    expect(warning).toHaveBeenCalledTimes(2);
+    warning.mockRestore();
   });
 });

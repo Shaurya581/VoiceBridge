@@ -212,12 +212,20 @@ model ClosureVerification {
   response       String?
   attemptNumber  Int                @default(1)
   evidenceRef    String?
+  taskCompletedAt DateTime?
+  language       String             @default("hi")
+  prompt         String             @default("")
+  deliveryMode   String             @default("MOCK")
+  deliveryStatus DeliveryStatus     @default(PENDING)
+  attemptCount   Int                @default(0)
+  lastAttemptAt  DateTime?
   requestedAt    DateTime           @default(now())
   respondedAt    DateTime?
   createdAt      DateTime           @default(now())
 
   @@index([incidentId, requestedAt])
   @@index([reporterId, status])
+  @@index([deliveryStatus, attemptCount, requestedAt])
 }
 
 model EmergencyEvent {

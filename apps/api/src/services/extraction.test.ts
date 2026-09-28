@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyPriorityRules, extractIncident, extractionSchema, type IncidentExtraction } from './extraction.js';
+import { MockSpeechToTextProvider } from './speech.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -69,5 +70,22 @@ describe('structured incident extraction', () => {
 
   it('does not call a provider for a blank transcript', async () => {
     await expect(extractIncident('   ')).rejects.toThrow('empty transcript');
+  });
+
+  it.each([
+    ['hi', 'मशीन 4 packaging line के पास तेज आवाज कर रही है। Maintenance कृपया जांचें।', true],
+    ['hinglish', 'Machine 4 se strange noise aa rahi hai packaging line ke paas, Maintenance ko check karna hai within 4 hours.', false],
+    ['ta', 'Packaging line அருகில் machine 4 அதிக சத்தம் செய்கிறது. Maintenance குழு check செய்யவும்.', true]
+  ] as const)('preserves %s report language and source details without filling unsupported fields', async (language, transcript, needsDeadlineConfirmation) => {
+    vi.stubEnv('LLM_PROVIDER', 'mock');
+    const transcription = await new MockSpeechToTextProvider().transcribe('/unused', 'audio/webm', language, transcript);
+    const result = await extractIncident(transcription.transcript, transcription.language);
+
+    expect(transcription.language).toBe(language);
+    expect(result.description).toBe(transcript);
+    expect(result.responsiblePerson).toBeNull();
+    expect(result.location?.toLowerCase()).toBe('packaging line');
+    expect(result.missingInformation.includes('deadline')).toBe(needsDeadlineConfirmation);
+    expect(result.requiresConfirmation).toBe(needsDeadlineConfirmation);
   });
 });

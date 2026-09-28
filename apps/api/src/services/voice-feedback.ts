@@ -4,8 +4,10 @@ export interface TextToSpeechProvider {
   speak(input: { text: string; language: SupportedLanguage; recipientId: string; kind: string }): Promise<void>;
 }
 
+export type TTSProvider = TextToSpeechProvider;
+
 export interface IVRProvider {
-  call(input: { phone?: string; recipientId: string; language: SupportedLanguage; prompt: string; kind: string }): Promise<{ status: 'SIMULATED' | 'PENDING'; response?: '1' | '2' }>;
+  call(input: { phone?: string; recipientId: string; verificationId?: string; language: SupportedLanguage; prompt: string; kind: string }): Promise<{ status: 'SIMULATED' | 'PENDING'; response?: string }>;
 }
 
 export interface EmergencyAlertProvider {
@@ -19,10 +21,10 @@ export class MockTextToSpeechProvider implements TextToSpeechProvider {
 }
 
 export class MockIVRProvider implements IVRProvider {
-  async call(input: { phone?: string; recipientId: string; language: SupportedLanguage; prompt: string; kind: string }) {
+  async call(input: { phone?: string; recipientId: string; verificationId?: string; language: SupportedLanguage; prompt: string; kind: string }) {
     console.info(JSON.stringify({ event: 'mock_ivr_call', ...input }));
     const configuredResponse = process.env.MOCK_IVR_RESPONSE;
-    const response: '1' | '2' | undefined = configuredResponse === '1' || configuredResponse === '2' ? configuredResponse : undefined;
+    const response = configuredResponse?.trim() || undefined;
     return { status: 'SIMULATED' as const, ...(response ? { response } : {}) };
   }
 }
@@ -35,12 +37,12 @@ export class MockEmergencyAlertProvider implements EmergencyAlertProvider {
 }
 
 export function textToSpeechProvider(): TextToSpeechProvider {
-  if (process.env.MOCK_TTS === 'false') throw new Error('A real TTS provider is not configured in this Phase 1 prototype.');
+  if (process.env.MOCK_TTS === 'false') console.warn(JSON.stringify({ event: 'tts_provider_unavailable_using_mock' }));
   return new MockTextToSpeechProvider();
 }
 
 export function ivrProvider(): IVRProvider {
-  if (process.env.MOCK_IVR === 'false') throw new Error('A real IVR provider is not configured in this Phase 1 prototype.');
+  if (process.env.MOCK_IVR === 'false') console.warn(JSON.stringify({ event: 'ivr_provider_unavailable_using_mock' }));
   return new MockIVRProvider();
 }
 
