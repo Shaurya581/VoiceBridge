@@ -47,6 +47,15 @@ function routeParam(request: Request, key: string) {
   return Array.isArray(value) ? value[0]! : String(value ?? '');
 }
 
+function managerCanAccessIncident(userId: string, incident: {
+  reporterId: string;
+  tasks: Array<{ assigneeId: string; assignee?: { managerId: string | null } | null }>;
+}) {
+  return incident.reporterId === userId || incident.tasks.some((task) =>
+    task.assigneeId === userId || task.assignee?.managerId === userId
+  );
+}
+
 function handleError(error: unknown, response: Response) {
   if (error instanceof ClarificationRequired) return response.status(202).json({ requiresConfirmation: true, clarification: error.message, options: error.options });
   if (error instanceof z.ZodError) return response.status(400).json({ error: 'Request validation failed.', details: error.flatten() });
@@ -200,8 +209,9 @@ export function apiRouter(db: DatabaseClient | null) {
   router.post('/incidents/:id/emergency-response', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
     const incidentId = routeParam(request, 'id');
-    const incident = await db.incident.findUnique({ where: { id: incidentId }, include: { voiceReports: { orderBy: { createdAt: 'asc' }, take: 1 } } });
+    const incident = await db.incident.findUnique({ where: { id: incidentId }, include: { voiceReports: { orderBy: { createdAt: 'asc' }, take: 1 }, tasks: { include: { assignee: { select: { managerId: true } } } } } });
     if (!incident) return response.status(404).json({ error: 'Incident not found.' });
+    if (request.user!.role === 'MANAGER' && !managerCanAccessIncident(request.user!.sub, incident)) return response.status(403).json({ error: 'You cannot access this incident.' });
     if (!incident.isEmergency) return response.status(409).json({ error: 'This is not an emergency incident.' });
     const event = await db.emergencyEvent.findFirst({ where: { incidentId, kind: 'IMMEDIATE_ALERT' }, orderBy: { triggeredAt: 'desc' } });
     if (!event || event.respondedAt) return response.status(409).json({ error: 'No unanswered emergency alert was found.' });
@@ -254,8 +264,9 @@ export function apiRouter(db: DatabaseClient | null) {
     if (!requireDb(db, response)) return;
     const input = z.object({ title: z.string().trim().min(3).max(160).optional(), description: z.string().trim().min(3).max(4000).optional(), location: z.string().trim().max(300).nullable().optional(), priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).optional(), deadline: z.string().datetime().optional() }).refine((value) => Object.keys(value).length > 0).parse(request.body);
     const incidentId = routeParam(request, 'id');
-    const incident = await db.incident.findUnique({ where: { id: incidentId }, include: { tasks: true } });
+    const incident = await db.incident.findUnique({ where: { id: incidentId }, include: { tasks: { include: { assignee: { select: { managerId: true } } } } } });
     if (!incident) return response.status(404).json({ error: 'Incident not found.' });
+    if (request.user!.role === 'MANAGER' && !managerCanAccessIncident(request.user!.sub, incident)) return response.status(403).json({ error: 'You cannot access this incident.' });
     const updated = await db.$transaction(async (tx) => {
       const result = await tx.incident.update({ where: { id: incidentId }, data: { ...input, deadline: input.deadline ? new Date(input.deadline) : undefined } });
       if (input.deadline) await tx.task.updateMany({ where: { incidentId }, data: { deadline: new Date(input.deadline) } });
@@ -333,10 +344,11 @@ export function apiRouter(db: DatabaseClient | null) {
     if (!requireDb(db, response)) return;
     const input = z.object({ incidentId: z.string().min(1), title: z.string().trim().min(3).max(160), description: z.string().trim().min(3).max(4000), assigneeId: z.string().min(1), deadline: z.string().datetime() }).parse(request.body);
     const [incident, assignee] = await Promise.all([
-      db.incident.findUnique({ where: { id: input.incidentId } }),
+      db.incident.findUnique({ where: { id: input.incidentId }, include: { tasks: { include: { assignee: { select: { managerId: true } } } } } }),
       db.employee.findFirst({ where: { id: input.assigneeId, isActive: true } })
     ]);
     if (!incident) return response.status(404).json({ error: 'Incident not found.' });
+    if (request.user!.role === 'MANAGER' && !managerCanAccessIncident(request.user!.sub, incident)) return response.status(403).json({ error: 'You cannot access this incident.' });
     if (!assignee) return response.status(400).json({ error: 'Choose an active employee.' });
     const task = await db.$transaction(async (tx) => {
       const created = await tx.task.create({ data: { incidentId: incident.id, title: input.title, description: input.description, assigneeId: assignee.id, createdById: request.user!.sub, deadline: new Date(input.deadline) } });
@@ -355,6 +367,7 @@ export function apiRouter(db: DatabaseClient | null) {
     if (!task) return response.status(404).json({ error: 'Task not found.' });
     const managerAccess = request.user!.role === 'MANAGER' || request.user!.role === 'ADMIN';
     if (task.assigneeId !== request.user!.sub && !managerAccess) return response.status(403).json({ error: 'Only the assignee or a manager can update this task.' });
+    if (request.user!.role === 'MANAGER' && task.assigneeId !== request.user!.sub && task.assignee.managerId !== request.user!.sub && task.incident.reporterId !== request.user!.sub) return response.status(403).json({ error: 'You cannot access this task.' });
     const allowed: Record<string, string[]> = { OPEN: ['IN_PROGRESS', 'COMPLETED'], IN_PROGRESS: ['COMPLETED'], OVERDUE: ['IN_PROGRESS', 'COMPLETED'], ESCALATED: ['IN_PROGRESS', 'COMPLETED'], REOPENED: ['IN_PROGRESS', 'COMPLETED'], EMERGENCY: ['IN_PROGRESS', 'COMPLETED'] };
     if (!allowed[task.status]?.includes(parsed.status)) return response.status(409).json({ error: `Cannot move a task from ${task.status} to ${parsed.status}.` });
     if (parsed.status === 'IN_PROGRESS' && !canTransitionIncident(task.incident.status, 'IN_PROGRESS')) return response.status(409).json({ error: `Cannot move an incident from ${task.incident.status} to IN_PROGRESS.` });
@@ -377,9 +390,10 @@ export function apiRouter(db: DatabaseClient | null) {
 
   router.post('/tasks/:id/complete', asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
-    const task = await db.task.findUnique({ where: { id: routeParam(request, 'id') } });
+    const task = await db.task.findUnique({ where: { id: routeParam(request, 'id') }, include: { assignee: true, incident: { select: { reporterId: true } } } });
     if (!task) return response.status(404).json({ error: 'Task not found.' });
     if (task.assigneeId !== request.user!.sub && request.user!.role !== 'MANAGER' && request.user!.role !== 'ADMIN') return response.status(403).json({ error: 'Only the assignee or a manager can complete this task.' });
+    if (request.user!.role === 'MANAGER' && task.assigneeId !== request.user!.sub && task.assignee.managerId !== request.user!.sub && task.incident.reporterId !== request.user!.sub) return response.status(403).json({ error: 'You cannot access this task.' });
     try {
       const result = await completeTaskForVerification(db, task.id, request.user!.sub);
       return response.json({ task: result.task, verification: result.verification, incidentStatus: result.incidentStatus });
@@ -408,9 +422,10 @@ export function apiRouter(db: DatabaseClient | null) {
   router.post('/incidents/:id/assign', requireRoles('MANAGER', 'ADMIN'), asyncRoute(async (request, response) => {
     if (!requireDb(db, response)) return;
     const input = z.object({ employeeId: z.string().min(1), reason: z.string().max(500).optional() }).parse(request.body);
-    const incident = await db.incident.findUnique({ where: { id: routeParam(request, 'id') }, include: { tasks: true } });
+    const incident = await db.incident.findUnique({ where: { id: routeParam(request, 'id') }, include: { tasks: { include: { assignee: { select: { managerId: true } } } } } });
     const employee = await db.employee.findFirst({ where: { id: input.employeeId, isActive: true } });
     if (!incident || !incident.tasks[0]) return response.status(404).json({ error: 'Incident task not found.' });
+    if (request.user!.role === 'MANAGER' && !managerCanAccessIncident(request.user!.sub, incident)) return response.status(403).json({ error: 'You cannot access this incident.' });
     if (!employee) return response.status(400).json({ error: 'Choose an active employee.' });
     const task = incident.tasks[0];
     await db.$transaction(async (tx) => {
