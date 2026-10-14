@@ -39,7 +39,7 @@ export function buildClosureResultMessage(confirmed: boolean, language: string |
 export async function completeTaskForVerification(db: DatabaseClient, taskId: string, actorId: string, providers: ClosureFeedbackProviders = {}) {
   const task = await db.task.findUnique({ where: { id: taskId }, include: { incident: { include: { voiceReports: { orderBy: { createdAt: 'asc' }, take: 1 } } } } });
   if (!task) throw new Error('Task not found');
-  const completableStatuses: WorkflowStatus[] = ['OPEN', 'IN_PROGRESS', 'OVERDUE', 'ESCALATED', 'REOPENED', 'EMERGENCY'];
+  const completableStatuses: WorkflowStatus[] = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'OVERDUE', 'ESCALATED', 'REOPENED', 'EMERGENCY'];
   if (!completableStatuses.includes(task.status)) throw new Error(`Cannot complete a task in ${task.status}.`);
   if (!canTransitionIncident(task.incident.status, 'REPORTER_VERIFICATION_PENDING')) throw new Error(`Cannot verify completion from incident state ${task.incident.status}.`);
   const reporter = await db.employee.findUnique({ where: { id: task.incident.reporterId } });
@@ -71,10 +71,34 @@ export async function completeTaskForVerification(db: DatabaseClient, taskId: st
       deliveryMode: 'MOCK',
       deliveryStatus: 'PENDING'
     } });
-    const updatedTask = await tx.task.findUnique({ where: { id: task.id } });
+    const updatedTask = await tx.task.findUnique({
+      where: { id: task.id },
+      include: {
+        incident: { select: { id: true, incidentNumber: true, title: true, location: true, priority: true, status: true } },
+        assignee: { select: { id: true, name: true, email: true } }
+      }
+    });
     await tx.auditLog.createMany({ data: [
-      { actorId, incidentId: task.incidentId, action: 'TASK_COMPLETED_BY_ASSIGNEE', reason: 'Assignee marked the task complete; original reporter verification is required.', metadata: { taskId: task.id, verificationId: verification.id, completedAt: now.toISOString() } },
-      { actorId: null, incidentId: task.incidentId, action: 'REPORTER_VERIFICATION_REQUESTED', reason: 'A spoken closure verification request was queued for the original reporter.', metadata: { taskId: task.id, verificationId: verification.id, reporterId: reporter.id, language, prompt } }
+      {
+        actorId,
+        incidentId: task.incidentId,
+        action: 'TASK_COMPLETED_BY_ASSIGNEE',
+        reason: 'Assignee marked the task complete; original reporter verification is required.',
+        metadata: {
+          taskId: task.id,
+          verificationId: verification.id,
+          previousStatus: task.status,
+          newStatus: 'COMPLETED_BY_ASSIGNEE',
+          completedAt: now.toISOString()
+        }
+      },
+      {
+        actorId: null,
+        incidentId: task.incidentId,
+        action: 'REPORTER_VERIFICATION_REQUESTED',
+        reason: 'A spoken closure verification request was queued for the original reporter.',
+        metadata: { taskId: task.id, verificationId: verification.id, reporterId: reporter.id, language, prompt }
+      }
     ] });
     return { task: updatedTask, verification };
   });

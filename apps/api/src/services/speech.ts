@@ -47,7 +47,7 @@ export class OpenAiSpeechToTextProvider implements SpeechToTextProvider {
     form.set('model', process.env.OPENAI_STT_MODEL ?? 'whisper-1');
     form.set('file', new File([audio], 'report-audio', { type: mimeType }));
     form.set('response_format', 'verbose_json');
-    if (language === 'hi' || language === 'ta' || language === 'hinglish') form.set('language', language === 'hinglish' ? 'hi' : language);
+    if (language === 'hi' || language === 'ta' || language === 'hinglish' || language === 'en') form.set('language', language === 'hinglish' ? 'hi' : language === 'en' ? 'en' : language);
     const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form
     });

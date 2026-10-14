@@ -35,9 +35,9 @@ const slaHours: Record<Priority, number> = {
 function departmentFrom(transcript: string) {
   const lower = transcript.toLowerCase();
   return departmentNames.find((department) => lower.includes(department.toLowerCase())) ??
-    (/(water|leak|washroom|building|door|light|air.?condition)/i.test(lower) ? 'Facilities' :
-      /(server|computer|network|software|printer|login)/i.test(lower) ? 'IT' :
-        /(machine|motor|conveyor|equipment|bearing|noise)/i.test(lower) ? 'Maintenance' : null);
+    (/(water|leak|washroom|building|door|light|air.?condition|पानी|रिसाव|दरवाज़ा|दरवाज़ा|लाइट|एसी|தண்ணீர்|கசிவு|கதவு)/iu.test(transcript) ? 'Facilities' :
+      /(server|computer|network|software|printer|login|सर्वर|कंप्यूटर|नेटवर्क|प्रिंटर|சேவையகம்|கணினி|நெட்வொர்க்)/iu.test(transcript) ? 'IT' :
+        /(machine|motor|conveyor|equipment|bearing|noise|मशीन|मोटर|कन्वेयर|उपकरण|शोर|आवाज|தொழில்|இயந்திரம்|மோட்டார்|சத்தம்)/iu.test(transcript) ? 'Maintenance' : null);
 }
 
 function deadlineFrom(transcript: string, priority: Priority, now = new Date()) {
@@ -106,10 +106,17 @@ function actionNeedsConfirmation(transcript: string) {
 function mockExtraction(transcript: string, language = 'hi'): IncidentExtraction {
   const trimmed = transcript.trim();
   const priority = priorityFrom(trimmed) ?? 'MEDIUM';
-  const asset = trimmed.match(/\b(machine\s*\d+|server(?: room)?|conveyor\s*\d+|pump\s*\d+)\b/i)?.[0] ?? null;
+  const assetEnglish = trimmed.match(/\b(machine\s*\d+|server(?: room)?|conveyor\s*\d+|pump\s*\d+)\b/i)?.[0] ?? null;
+  const assetHindi = !assetEnglish ? trimmed.match(/(मशीन\s*\d+)/u)?.[1]?.trim() ?? null : null;
+  const asset = assetEnglish ?? (assetHindi ? assetHindi.replace(/मशीन\s*/u, 'Machine ') : null);
   const englishLocation = trimmed.match(/(?:near|at|in|on)\s+(?:the\s+)?([^,.!?]{3,80})/i)?.[1]?.trim();
-  const localizedWorkplaceLocation = trimmed.match(/\b((?:packaging|assembly|production)\s+line|loading\s+bay|server\s+room|warehouse|cafeteria|boiler\s+room)\s+(?:ke paas|के पास|அருகில்)/iu)?.[1]?.trim();
-  const location = localizedWorkplaceLocation ?? englishLocation ?? null;
+  const localizedWorkplaceLocation = trimmed.match(/\b((?:packaging|assembly|production)\s+line|loading\s+bay|server\s+room|warehouse|cafeteria|boiler\s+room)(?:\s+(?:ke paas|के पास|அருகில்|ke samne|के सामने|mein|में|par|पर|pe|पे))?\b/iu)?.[1]?.trim();
+  const hindiWorkplaceLocation = !localizedWorkplaceLocation ? trimmed.match(/(पैकेजिंग\s+लाइन|असेंबली\s+लाइन|प्रोडक्शन\s+लाइन|सर्वर\s+रूम|लोडिंग\s+बे|बॉयलर\s+रूम|गोदाम|वेयरहाउस|कैफेटेरिया)(?:\s+(?:ke paas|के पास))?/iu)?.[1]?.trim() ?? null : null;
+  const tamilWorkplaceLocation = !localizedWorkplaceLocation && !hindiWorkplaceLocation ? trimmed.match(/(பேக்கேஜிங்\s+லைன்|அசெம்ப்ளி\s+லைன்|சர்வர்\s+ரூம்|கிடங்கு|உணவகம்)(?:\s+அருகில்)?/iu)?.[1]?.trim() ?? null : null;
+  const hindiLocationNormalized: Record<string, string> = { 'पैकेजिंग लाइन': 'packaging line', 'असेंबली लाइन': 'assembly line', 'प्रोडक्शन लाइन': 'production line', 'सर्वर रूम': 'server room', 'लोडिंग बे': 'loading bay', 'बॉयलर रूम': 'boiler room', 'गोदाम': 'warehouse', 'वेयरहाउस': 'warehouse', 'कैफेटेरिया': 'cafeteria' };
+  const tamilLocationNormalized: Record<string, string> = { 'பேக்கேஜிங் லைன்': 'packaging line', 'அசெம்ப்ளி லைன்': 'assembly line', 'சர்வர் ரூம்': 'server room', 'கிடங்கு': 'warehouse', 'உணவகம்': 'cafeteria' };
+  const nativeLocation = hindiWorkplaceLocation ? (hindiLocationNormalized[hindiWorkplaceLocation] ?? hindiWorkplaceLocation) : tamilWorkplaceLocation ? (tamilLocationNormalized[tamilWorkplaceLocation] ?? tamilWorkplaceLocation) : null;
+  const location = localizedWorkplaceLocation ?? nativeLocation ?? englishLocation ?? null;
   const department = departmentFrom(trimmed);
   const vague = /(something is wrong|that machine over there|over there|the thing is broken)/i.test(trimmed);
   const confidence = vague || (trimmed.length < 45 && !asset && !location) ? 0.35 : department && (asset || location) ? 0.91 : department ? 0.76 : 0.48;

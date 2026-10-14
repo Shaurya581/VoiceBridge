@@ -73,6 +73,7 @@ const openApiDocument = {
   paths: {
     '/api/health': { get: { summary: 'Health and database connectivity', responses: { '200': { description: 'Healthy' }, '503': { description: 'Database unavailable' } } } },
     '/api/auth/login': { post: { summary: 'Create a session', responses: { '200': { description: 'Signed in' } } } },
+    '/api/auth/google': { post: { summary: 'Sign in with Google SSO', responses: { '200': { description: 'Signed in via Google' } } } },
     '/api/auth/register': { post: { summary: 'Register an employee', responses: { '201': { description: 'Account created' } } } },
     '/api/voice/upload': { post: { summary: 'Submit audio and transcript', security: [{ bearerAuth: [] }], responses: { '201': { description: 'Incident and task created' }, '202': { description: 'Human confirmation required' } } } },
     '/api/incidents': { get: { summary: 'List incidents visible to the current user', security: [{ bearerAuth: [] }], responses: { '200': { description: 'Incident list' } } } },

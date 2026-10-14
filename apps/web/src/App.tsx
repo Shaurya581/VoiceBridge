@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, AlertTriangle, ArrowDownRight, ArrowRight, Bell, Check, ChevronRight, CircleHelp, Clock3, FileAudio2, LayoutDashboard, ListChecks, LoaderCircle, LogOut, Mic, Pause, Play, Plus, Search, ShieldCheck, Users, X } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowDownRight, ArrowRight, Bell, Check, ChevronRight, CircleHelp, Clock3, FileAudio2, LayoutDashboard, ListChecks, LoaderCircle, LogOut, Mic, Pause, PhoneCall, Play, Plus, RotateCcw, Search, ShieldCheck, Users, X } from 'lucide-react';
 
 type Role = 'EMPLOYEE' | 'MANAGER' | 'ADMIN';
-type User = { id: string; name: string; email: string; role: Role; department: string | null };
-type Incident = { id: string; incidentNumber: string; title: string; description: string; location: string | null; priority: string; status: string; deadline: string; createdAt: string; reporter?: { name: string }; tasks: Task[] };
+type User = { id: string; name: string; email: string; role: Role; department: string | null; authProvider?: string };
+type Incident = { id: string; incidentNumber: string; title: string; description: string; location: string | null; priority: string; status: string; deadline: string; createdAt: string; reporterId?: string; reporter?: { id?: string; name: string }; tasks: Task[]; closureVerifications?: Array<{ id: string; status: string; prompt: string; attemptNumber: number }> };
 type Task = { id: string; title: string; status: string; deadline: string; assignee: { id: string; name: string; email: string }; incident: Pick<Incident, 'id' | 'incidentNumber' | 'title' | 'location' | 'priority' | 'status'> };
 type Employee = { id: string; name: string; email: string; role: Role; department?: { name: string } | null };
 type Extraction = { title: string; description: string; abnormality: string | null; asset: string | null; location: string | null; responsibleDepartment: string | null; responsiblePerson: string | null; priority: string; deadline: string; requestedAction: string; confidence: number; missingInformation: string[]; requiresConfirmation: boolean };
@@ -21,7 +21,46 @@ interface BrowserRecognition {
 }
 interface BrowserWindow extends Window { SpeechRecognition?: new () => BrowserRecognition; webkitSpeechRecognition?: new () => BrowserRecognition }
 
-const labels: Record<Page, string> = { dashboard: 'Overview', report: 'Report an issue', reports: 'My reports', tasks: 'Tasks', team: 'Team', audit: 'Audit log' };
+const labels: Record<Page, string> = { dashboard: 'Overview', report: 'Report an issue', reports: 'Incidents', tasks: 'Tasks', team: 'Team', audit: 'Audit log' };
+const recognitionLang: Record<string, string> = { hi: 'hi-IN', hinglish: 'hi-IN', ta: 'ta-IN', en: 'en-IN' };
+const languageLabels: Record<string, { name: string; script: string; example: string }> = {
+  hi: { name: 'Hindi', script: 'Devanagari', example: 'हिन्दी' },
+  hinglish: { name: 'Hinglish', script: 'Roman/Latin', example: 'Hindi in English script' },
+  ta: { name: 'Tamil', script: 'Tamil', example: 'தமிழ்' },
+  en: { name: 'English', script: 'English', example: 'English' },
+};
+function timeGreeting(): string {
+  const h = new Date().getHours();
+  if (h < 12) return 'Good morning';
+  if (h < 17) return 'Good afternoon';
+  return 'Good evening';
+}
+
+/* Lightweight Devanagari → Latin transliteration for Hinglish display */
+const _C: Record<string, string> = {'क':'k','ख':'kh','ग':'g','घ':'gh','ङ':'ng','च':'ch','छ':'chh','ज':'j','झ':'jh','ञ':'n','ट':'t','ठ':'th','ड':'d','ढ':'dh','ण':'n','त':'t','थ':'th','द':'d','ध':'dh','न':'n','प':'p','फ':'ph','ब':'b','भ':'bh','म':'m','य':'y','र':'r','ल':'l','व':'v','श':'sh','ष':'sh','स':'s','ह':'h','क़':'q','ज़':'z','ड़':'r','ढ़':'rh','फ़':'f'};
+const _V: Record<string, string> = {'अ':'a','आ':'aa','इ':'i','ई':'ee','उ':'u','ऊ':'oo','ऋ':'ri','ए':'e','ऐ':'ai','ओ':'o','औ':'au'};
+const _M: Record<string, string> = {'ा':'aa','ि':'i','ी':'ee','ु':'u','ू':'oo','ृ':'ri','े':'e','ै':'ai','ो':'o','ौ':'au','ं':'n','ः':'h','ँ':'n'};
+const _W: Record<string, string> = {'के':'ke','का':'ka','की':'ki','है':'hai','हैं':'hain','में':'mein','से':'se','पर':'par','को':'ko','और':'aur','कृपया':'kripya','भी':'bhi','नहीं':'nahi','बहुत':'bahut','तेज':'tez','अजीब':'ajeeb','आवाज':'awaaz','आवाज़':'awaaz','शोर':'shor','मशीन':'machine','पैकेजिंग':'packaging','लाइन':'line','सर्वर':'server','रूम':'room','कंप्यूटर':'computer','नेटवर्क':'network','मोटर':'motor','कन्वेयर':'conveyor','पानी':'paani','रिसाव':'risaav','लाइट':'light','एसी':'AC','कैफेटेरिया':'cafeteria','गोदाम':'godaam','वेयरहाउस':'warehouse','बॉयलर':'boiler','लोडिंग':'loading','बे':'bay','असेंबली':'assembly','प्रोडक्शन':'production','रही':'rahi','रहा':'raha','हो':'ho','कर':'kar','चेक':'check','मेंटेनेंस':'maintenance','जांचें':'jaanchein','देखें':'dekhein','बताएं':'bataein','ठीक':'theek','करें':'karein','आ':'aa','प्लीज':'please','दरवाज़ा':'darwaza'};
+function _tw(w: string): string {
+  if (/^[\x00-\x7F]+$/u.test(w)) return w;
+  if (_W[w]) return _W[w];
+  let r = ''; const c = [...w]; let i = 0;
+  while (i < c.length) {
+    const ch = c[i]!;
+    if (_V[ch]) { r += _V[ch]; i++; continue; }
+    if (_C[ch]) { const b = _C[ch]!; i++; if (c[i]==='\u094D') { r += b; i++; } else if (c[i] && _M[c[i]!]) { r += b + _M[c[i]!]; i++; } else { r += (i >= c.length ? b : b + 'a'); } continue; }
+    if (_M[ch]) { r += _M[ch]; i++; continue; }
+    if (ch === '\u094D') { i++; continue; }
+    const dd = '०१२३४५६७८९'.indexOf(ch); if (dd >= 0) { r += String(dd); i++; continue; }
+    r += ch; i++;
+  }
+  return r;
+}
+function translitHinglish(text: string): string {
+  if (!/[\u0900-\u097F]/u.test(text)) return text;
+  let p = text; for (const [h, e] of Object.entries(_W)) { if (h.includes(' ') && p.includes(h)) p = p.replaceAll(h, e); }
+  return p.split(/(\s+)/u).map(s => /^\s+$/u.test(s) ? s : _tw(s)).join('');
+}
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -40,7 +79,8 @@ function dateLabel(value: string) {
 }
 
 function statusStyle(value: string) {
-  return `status status-${value.toLowerCase().replaceAll('_', '-')}`;
+  const norm = value === 'COMPLETED_BY_ASSIGNEE' ? 'completed' : value.toLowerCase().replaceAll('_', '-');
+  return `status status-${norm}`;
 }
 
 function dateInput(value: string) {
@@ -67,6 +107,7 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [loginEmail, setLoginEmail] = useState('employee@voicebridge.local');
   const [loginPassword, setLoginPassword] = useState('VoiceBridgeDemo2026!');
+  const [showGoogleModal, setShowGoogleModal] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [transcript, setTranscript] = useState('');
@@ -138,6 +179,27 @@ export default function App() {
     finally { setLoading(false); }
   }
 
+  async function signInWithGoogle(googleData?: { credential?: string; email?: string; name?: string }) {
+    setError(''); setLoading(true); setShowGoogleModal(false);
+    try {
+      const payload = googleData ?? { email: 'employee@voicebridge.local', name: 'Sam Reporter' };
+      const result = await request<{ token: string; user: User }>('/api/auth/google', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      localStorage.setItem('voicebridge.token', result.token);
+      localStorage.setItem('voicebridge.user', JSON.stringify(result.user));
+      setToken(result.token);
+      setUser(result.user);
+      setNotice(`Signed in with Google as ${result.user.name}.`);
+      await refreshData();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Google sign-in failed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function startRecording() {
     setError(''); setNotice(''); setTranscript(''); setElapsed(0); setAudioBlob(null);
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -159,11 +221,12 @@ export default function App() {
       const Recognition = browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
       if (Recognition) {
         const recognition = new Recognition();
-        recognition.continuous = true; recognition.interimResults = true; recognition.lang = reportLanguage === 'ta' ? 'ta-IN' : 'hi-IN';
+        recognition.continuous = true; recognition.interimResults = true; recognition.lang = recognitionLang[reportLanguage] ?? 'hi-IN';
         recognition.onresult = (event) => {
           const words: string[] = [];
           for (let index = 0; index < event.results.length; index += 1) words.push(event.results[index]?.[0]?.transcript ?? '');
-          setTranscript(words.join(' ').trim());
+          const raw = words.join(' ').trim();
+          setTranscript(reportLanguage === 'hinglish' ? translitHinglish(raw) : raw);
         };
         recognition.onerror = () => setListeningSupported(false);
         recognitionRef.current = recognition; recognition.start();
@@ -219,19 +282,94 @@ export default function App() {
     finally { setLoading(false); }
   }
 
-  async function updateTask(task: Task, status: string) {
+  async function completeTask(task: Task) {
     setLoading(true); setError('');
     try {
-      const result = await request<{ incidentStatus?: string }>(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
-      setNotice(status === 'COMPLETED'
-        ? result.incidentStatus === 'CLOSED' ? 'Reporter confirmed the fix. Incident closed.' : result.incidentStatus === 'REOPENED' ? 'Reporter said the issue remains. Incident reopened.' : 'Work marked complete. Reporter verification is pending.'
-        : 'Task status updated.');
+      const result = await request<{ task: Task; incidentStatus?: string; verification?: { id: string } }>(`/api/tasks/${task.id}/complete`, { method: 'POST' });
+      if (result.task) {
+        setTasks((prev) => prev.map((t) => t.id === result.task.id ? { ...t, ...result.task } : t));
+        setIncidents((prev) => prev.map((inc) => inc.id === task.incident.id ? {
+          ...inc,
+          status: result.incidentStatus || 'REPORTER_VERIFICATION_PENDING',
+          tasks: inc.tasks.map((t) => t.id === result.task.id ? { ...t, ...result.task } : t)
+        } : inc));
+      }
+      setNotice(result.incidentStatus === 'CLOSED'
+        ? 'Reporter confirmed the fix. Incident closed.'
+        : result.incidentStatus === 'REOPENED'
+        ? 'Reporter said the issue remains. Incident reopened.'
+        : 'Task marked complete. Spoken reporter verification is pending.');
+      await refreshData();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The task could not be completed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function updateTask(task: Task, status: string) {
+    if (status === 'COMPLETED') {
+      return completeTask(task);
+    }
+    setLoading(true); setError('');
+    try {
+      const result = await request<{ task?: Task; incidentStatus?: string }>(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      if (result.task) {
+        setTasks((prev) => prev.map((t) => t.id === result.task!.id ? { ...t, ...result.task! } : t));
+      }
+      setNotice('Task status updated.');
       await refreshData();
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'The task could not be updated.'); }
     finally { setLoading(false); }
   }
 
-  if (!token || !user) return <Login email={loginEmail} password={loginPassword} setEmail={setLoginEmail} setPassword={setLoginPassword} onSubmit={signIn} loading={loading} error={error} />;
+  async function verifyClosure(incident: Incident, responseChoice: '1' | '2') {
+    setLoading(true); setError('');
+    try {
+      let verificationId = incident.closureVerifications?.[0]?.id;
+      if (!verificationId) {
+        const fresh = await request<{ incident: Incident }>(`/api/incidents/${incident.id}`);
+        verificationId = fresh.incident.closureVerifications?.[0]?.id;
+      }
+      if (!verificationId) throw new Error('No pending closure verification found for this incident.');
+      const result = await request<{ status: string }>(`/api/incidents/${incident.id}/verify-closure`, {
+        method: 'POST',
+        body: JSON.stringify({ verificationId, response: responseChoice })
+      });
+      setNotice(result.status === 'CLOSED'
+        ? 'Reporter confirmed the fix. Incident closed.'
+        : 'Reporter said the issue remains. Incident reopened.');
+      await refreshData();
+      setSelectedIncident(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Closure verification could not be recorded.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (!token || !user) {
+    return (
+      <>
+        <Login
+          email={loginEmail}
+          password={loginPassword}
+          setEmail={setLoginEmail}
+          setPassword={setLoginPassword}
+          onSubmit={signIn}
+          onGoogleLogin={() => setShowGoogleModal(true)}
+          loading={loading}
+          error={error}
+        />
+        <GoogleAuthModal
+          isOpen={showGoogleModal}
+          onClose={() => setShowGoogleModal(false)}
+          onSelectAccount={signInWithGoogle}
+          loading={loading}
+        />
+      </>
+    );
+  }
 
   const filteredIncidents = incidents.filter((incident) => `${incident.incidentNumber} ${incident.title} ${incident.location ?? ''} ${incident.status}`.toLowerCase().includes(search.toLowerCase()));
   const openCount = incidents.filter((item) => ['OPEN', 'IN_PROGRESS', 'EMERGENCY', 'REOPENED', 'REPORTER_VERIFICATION_PENDING', 'AWAITING_CONFIRMATION'].includes(item.status)).length;
@@ -263,21 +401,63 @@ export default function App() {
     <main className="main-area">
       <header className="page-header">
         <div className="breadcrumb">VoiceBridge <ChevronRight size={14} /> <span>{labels[page]}</span></div>
-        <div className="header-right"><span className="live-indicator"><i /> System ready</span><span className="header-date">{new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date())}</span><button className="icon-button" aria-label="Notifications" onClick={() => setNotice('You are up to date.') }><Bell size={17} /></button></div>
+        <div className="header-right">
+          <button
+            type="button"
+            className="google-badge-pill"
+            onClick={() => setShowGoogleModal(true)}
+            title="Google Workspace Single Sign-On"
+            id="header-google-pill"
+          >
+            <GoogleIcon size={14} />
+            <span>{user.authProvider === 'google' ? user.email : 'Google Login'}</span>
+          </button>
+          <span className="live-indicator"><i /> System ready</span>
+          <span className="header-date">{new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date())}</span>
+          <button className="icon-button" aria-label="Notifications" onClick={() => setNotice('You are up to date.') }><Bell size={17} /></button>
+        </div>
       </header>
       <div className="content-wrap">
         {error && <div className="alert error-alert"><AlertTriangle size={17} /><span>{error}</span><button onClick={() => setError('')} aria-label="Dismiss"><X size={16} /></button></div>}
         {notice && <div className="alert notice-alert"><Check size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={16} /></button></div>}
         {loading && <div className="loading-line"><LoaderCircle size={15} className="spin" /> Updating your workspace…</div>}
-        {page === 'dashboard' && <Dashboard user={user} incidents={incidents} tasks={tasks} openCount={openCount} overdueCount={overdueCount} completedCount={completedCount} onReport={() => setPage('report')} onOpenIncident={setSelectedIncident} onViewTasks={() => setPage('tasks')} />}
+        {page === 'dashboard' && (
+          <Dashboard
+            user={user}
+            incidents={incidents}
+            tasks={tasks}
+            openCount={openCount}
+            overdueCount={overdueCount}
+            completedCount={completedCount}
+            onReport={() => setPage('report')}
+            onOpenIncident={setSelectedIncident}
+            onViewTasks={() => setPage('tasks')}
+            onGoogleLogin={() => setShowGoogleModal(true)}
+          />
+        )}
         {page === 'report' && <ReportPage recording={isRecording} elapsed={elapsed} transcript={transcript} setTranscript={setTranscript} language={reportLanguage} setLanguage={setReportLanguage} audioUrl={audioUrl} listeningSupported={listeningSupported} pending={pendingReport} edited={editedExtraction} setEdited={setEditedExtraction} employees={employees} assigneeId={assigneeId} setAssigneeId={setAssigneeId} onStart={() => void startRecording()} onStop={stopRecording} onSubmit={submitReport} onConfirm={confirmReport} onRetry={() => { setTranscript(''); setAudioBlob(null); setAudioUrl(''); setPendingReport(null); }} loading={loading} />}
         {page === 'reports' && <IncidentsPage incidents={filteredIncidents} search={search} setSearch={setSearch} onOpen={setSelectedIncident} />}
-        {page === 'tasks' && <TasksPage tasks={tasks} onUpdate={updateTask} onOpenIncident={(id) => { const incident = incidents.find((item) => item.id === id); if (incident) setSelectedIncident(incident); }} />}
+        {page === 'tasks' && <TasksPage tasks={tasks} onComplete={completeTask} onUpdate={updateTask} onOpenIncident={(id) => { const incident = incidents.find((item) => item.id === id); if (incident) setSelectedIncident(incident); }} loading={loading} />}
         {page === 'team' && <TeamPage employees={employees} />}
         {page === 'audit' && <AuditPage events={auditEvents} />}
       </div>
     </main>
-    {selectedIncident && <IncidentDrawer incident={selectedIncident} onClose={() => setSelectedIncident(null)} />}
+    {selectedIncident && (
+      <IncidentDrawer
+        incident={selectedIncident}
+        currentUser={user}
+        onCompleteTask={completeTask}
+        onVerifyClosure={verifyClosure}
+        onClose={() => setSelectedIncident(null)}
+        loading={loading}
+      />
+    )}
+    <GoogleAuthModal
+      isOpen={showGoogleModal}
+      onClose={() => setShowGoogleModal(false)}
+      onSelectAccount={signInWithGoogle}
+      loading={loading}
+    />
   </div>;
 }
 
@@ -285,12 +465,139 @@ function NavItem({ active, icon, onClick, children }: { active: boolean; icon: R
   return <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick}>{icon}<span>{children}</span>{active && <i />}</button>;
 }
 
-function Login({ email, password, setEmail, setPassword, onSubmit, loading, error }: { email: string; password: string; setEmail: (value: string) => void; setPassword: (value: string) => void; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void; loading: boolean; error: string }) {
+function GoogleIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" fill="#FBBC05"/>
+      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" fill="#EA4335"/>
+    </svg>
+  );
+}
+
+function GoogleAuthModal({
+  isOpen,
+  onClose,
+  onSelectAccount,
+  loading
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelectAccount: (data: { email: string; name: string }) => void;
+  loading: boolean;
+}) {
+  const [customEmail, setCustomEmail] = useState('');
+  const [customName, setCustomName] = useState('');
+  const [showCustom, setShowCustom] = useState(false);
+
+  if (!isOpen) return null;
+
+  const demoAccounts = [
+    { name: 'Sam Reporter', email: 'employee@voicebridge.local', role: 'Employee · Maintenance', avatar: 'SR' },
+    { name: 'Operations Lead', email: 'operations.manager@voicebridge.local', role: 'Manager · Operations', avatar: 'OL' },
+    { name: 'Avery Admin', email: 'admin@voicebridge.local', role: 'Administrator · System', avatar: 'AA' },
+  ];
+
+  return (
+    <div className="modal-backdrop" onClick={onClose} role="dialog" aria-modal="true" aria-labelledby="google-modal-title">
+      <div className="google-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="google-modal-header">
+          <GoogleIcon size={32} />
+          <h2 id="google-modal-title">Sign in with Google</h2>
+          <p>Choose an account to continue to <strong>VoiceBridge</strong></p>
+        </div>
+
+        <div className="google-account-list">
+          {demoAccounts.map((account) => (
+            <button
+              key={account.email}
+              type="button"
+              className="google-account-item"
+              disabled={loading}
+              onClick={() => onSelectAccount({ email: account.email, name: account.name })}
+            >
+              <span className="google-acc-avatar">{account.avatar}</span>
+              <div className="google-acc-info">
+                <strong>{account.name}</strong>
+                <span>{account.email}</span>
+                <small>{account.role}</small>
+              </div>
+              <ChevronRight size={16} className="google-acc-arrow" />
+            </button>
+          ))}
+        </div>
+
+        {!showCustom ? (
+          <button
+            type="button"
+            className="google-custom-btn"
+            onClick={() => setShowCustom(true)}
+          >
+            + Use another Google Workspace account
+          </button>
+        ) : (
+          <form
+            className="google-custom-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (customEmail.trim()) {
+                onSelectAccount({ email: customEmail.trim(), name: customName.trim() || customEmail.trim().split('@')[0] || 'Google User' });
+              }
+            }}
+          >
+            <label>
+              Google Account Email
+              <input
+                type="email"
+                placeholder="user@workspace.com"
+                value={customEmail}
+                onChange={(e) => setCustomEmail(e.target.value)}
+                required
+                autoFocus
+              />
+            </label>
+            <label>
+              Display Name (Optional)
+              <input
+                type="text"
+                placeholder="Full Name"
+                value={customName}
+                onChange={(e) => setCustomName(e.target.value)}
+              />
+            </label>
+            <div className="google-custom-actions">
+              <button type="button" className="secondary-button small" onClick={() => setShowCustom(false)}>Cancel</button>
+              <button type="submit" className="primary-button small" disabled={loading}>Continue with Google</button>
+            </div>
+          </form>
+        )}
+
+        <div className="google-modal-footer">
+          <small>To continue, Google will share your name, email address, and language preference with VoiceBridge.</small>
+          <button type="button" className="google-cancel-btn" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Login({ email, password, setEmail, setPassword, onSubmit, onGoogleLogin, loading, error }: {
+  email: string; password: string; setEmail: (value: string) => void; setPassword: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void; onGoogleLogin: () => void; loading: boolean; error: string;
+}) {
   return <div className="login-screen">
     <div className="login-brand"><span className="brand-mark"><Activity size={19} /></span>VoiceBridge</div>
     <div className="login-card">
       <p className="eyebrow">OPERATIONAL WORKFLOW</p><h1>Welcome back</h1><p className="login-intro">Sign in to report an issue or follow up on active work.</p>
       {error && <div className="alert error-alert"><AlertTriangle size={16} />{error}</div>}
+      <button type="button" className="google-button wide" onClick={onGoogleLogin} disabled={loading} id="google-login-button">
+        <GoogleIcon size={18} />
+        <span>Sign in with Google</span>
+      </button>
+
+      <div className="auth-divider"><span>or continue with email</span></div>
+
       <form onSubmit={onSubmit} className="login-form">
         <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required autoComplete="username" /></label>
         <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required autoComplete="current-password" /></label>
@@ -303,20 +610,41 @@ function Login({ email, password, setEmail, setPassword, onSubmit, loading, erro
   </div>;
 }
 
-function Dashboard({ user, incidents, tasks, openCount, overdueCount, completedCount, onReport, onOpenIncident, onViewTasks }: { user: User; incidents: Incident[]; tasks: Task[]; openCount: number; overdueCount: number; completedCount: number; onReport: () => void; onOpenIncident: (incident: Incident) => void; onViewTasks: () => void }) {
+function Dashboard({
+  user, incidents, tasks, openCount, overdueCount, completedCount, onReport, onOpenIncident, onViewTasks, onGoogleLogin
+}: {
+  user: User; incidents: Incident[]; tasks: Task[]; openCount: number; overdueCount: number; completedCount: number;
+  onReport: () => void; onOpenIncident: (incident: Incident) => void; onViewTasks: () => void; onGoogleLogin: () => void;
+}) {
   const recent = incidents.slice(0, 5);
+  const isGoogle = user.authProvider === 'google';
+
   return <>
-    <div className="welcome-row"><div><p className="eyebrow">YOUR OPERATIONS AT A GLANCE</p><h1>Good day, {user.name.split(' ')[0]}</h1><p className="subheading">Reports, ownership, and follow-through in one place.</p></div><button className="primary-button" onClick={onReport}><Plus size={17} /> Report an issue</button></div>
+    <div className="welcome-row">
+      <div>
+        <p className="eyebrow">YOUR OPERATIONS AT A GLANCE</p>
+        <h1>{timeGreeting()}, {user.name.split(' ')[0]}</h1>
+        <p className="subheading">Reports, ownership, and follow-through in one place.</p>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+        <button type="button" className="google-badge-pill" onClick={onGoogleLogin} title="Google Workspace Single Sign-On" id="dashboard-google-pill">
+          <GoogleIcon size={14} />
+          <span>{isGoogle ? 'Google: ' + user.email : 'Google Login'}</span>
+        </button>
+        <button className="primary-button" onClick={onReport}><Plus size={17} /> Report an issue</button>
+      </div>
+    </div>
+
     <div className="metric-grid">
-      <Metric title="Open incidents" value={openCount} icon={<Activity size={18} />} accent="blue" note="Needs active follow-up" />
-      <Metric title="Overdue or escalated" value={overdueCount} icon={<AlertTriangle size={18} />} accent="rose" note="Requires attention" />
-      <Metric title="Resolved" value={completedCount} icon={<Check size={18} />} accent="green" note="Closed the loop" />
-      <Metric title="My active tasks" value={tasks.filter((task) => !['COMPLETED', 'COMPLETED_BY_ASSIGNEE', 'CLOSED'].includes(task.status)).length} icon={<ListChecks size={18} />} accent="violet" note="Assigned to you" />
+      <Metric title="Open incidents" value={openCount} icon={<Activity size={18} />} accent="blue" note="Active" />
+      <Metric title="Overdue / escalated" value={overdueCount} icon={<AlertTriangle size={18} />} accent="rose" note={overdueCount > 0 ? 'Needs attention' : 'None'} />
+      <Metric title="Resolved" value={completedCount} icon={<Check size={18} />} accent="green" note="Closed" />
+      <Metric title="Active tasks" value={tasks.filter((task) => !['COMPLETED', 'COMPLETED_BY_ASSIGNEE', 'CLOSED'].includes(task.status)).length} icon={<ListChecks size={18} />} accent="violet" note="Assigned to you" />
     </div>
     <div className="dashboard-grid">
       <section className="panel incidents-panel">
         <div className="panel-heading"><div><h2>Recent incidents</h2><p>Most recent reports in your workspace</p></div><button className="text-button" onClick={onViewTasks}>Open tasks <ArrowRight size={14} /></button></div>
-        {recent.length ? <div className="table-wrap"><table><thead><tr><th>Issue</th><th>Location</th><th>Priority</th><th>Owner</th><th>Status</th></tr></thead><tbody>{recent.map((incident) => <tr key={incident.id} onClick={() => onOpenIncident(incident)}><td><strong>{incident.title}</strong><small>{incident.incidentNumber}</small></td><td>{incident.location || '—'}</td><td><Priority value={incident.priority} /></td><td>{incident.tasks[0]?.assignee?.name ?? 'Awaiting owner'}</td><td><span className={statusStyle(incident.status)}>{prettyStatus(incident.status)}</span></td></tr>)}</tbody></table></div> : <EmptyState title="No reports yet" body="Your submitted reports and assigned work will appear here." action="Report an issue" onClick={onReport} />}
+        {recent.length ? <div className="table-wrap"><table><thead><tr><th>Issue</th><th>Location</th><th>Priority</th><th>Owner</th><th>Status</th></tr></thead><tbody>{recent.map((incident) => <tr key={incident.id} onClick={() => onOpenIncident(incident)}><td><strong>{incident.title}</strong><small>{incident.incidentNumber}</small></td><td className="cell-location">{incident.location || '—'}</td><td><Priority value={incident.priority} /></td><td className="cell-assignee">{incident.tasks[0]?.assignee?.name ?? 'Awaiting owner'}</td><td><span className={statusStyle(incident.status)}>{prettyStatus(incident.status)}</span></td></tr>)}</tbody></table></div> : <EmptyState title="No reports yet" body="Your submitted reports and assigned work will appear here." action="Report an issue" onClick={onReport} />}
       </section>
       <section className="panel focus-panel"><div className="panel-heading"><div><h2>Needs your attention</h2><p>Tasks that are due or past due</p></div><span className="attention-icon"><AlertTriangle size={16} /></span></div>
         {tasks.filter((task) => !['COMPLETED', 'COMPLETED_BY_ASSIGNEE', 'CLOSED'].includes(task.status)).slice(0, 4).map((task) => <button className="focus-task" key={task.id} onClick={() => onOpenIncident(incidents.find((item) => item.id === task.incident.id) ?? { ...task.incident, description: '', createdAt: '', deadline: task.deadline, tasks: [] })}><span className="focus-dot"/><span className="focus-copy"><strong>{task.title}</strong><small>{task.incident.incidentNumber} · {task.assignee.name}</small></span><span className={statusStyle(task.status)}>{prettyStatus(task.status)}</span></button>)}
@@ -339,10 +667,12 @@ function ReportPage(props: {
 }) {
   const mm = String(Math.floor(props.elapsed / 60)).padStart(2, '0'); const ss = String(props.elapsed % 60).padStart(2, '0');
   return <>
-    <div className="page-title-row"><div><p className="eyebrow">QUICK REPORT</p><h1>Report an issue</h1><p className="subheading">Say what happened in your own words. We’ll help route the follow-up.</p></div><span className="step-pill"><span>1</span> Speak <i/> <span>2</span> Review <i/> <span>3</span> Submit</span></div>
+    <div className="page-title-row"><div><p className="eyebrow">QUICK REPORT</p><h1>Report an issue</h1><p className="subheading">Describe what happened in your own words. We'll route the follow-up.</p></div><span className="step-pill"><span>1</span> Record <i/> <span>2</span> Review <i/> <span>3</span> Submit</span></div>
     {props.pending && props.edited ? <section className="panel review-panel">
       <div className="review-head"><span className="review-icon"><CircleHelp size={20}/></span><div><h2>Review before we assign</h2><p>{props.pending.clarification}</p></div></div>
-      <div className="transcript-quote"><span>WHAT WE HEARD</span><p>“{props.transcript}”</p></div>
+      <div className="transcript-quote"><span>WHAT WE HEARD</span><p>"{props.transcript}"</p></div>
+      {props.edited.missingInformation.length > 0 && <div className="alert error-alert" style={{ marginBottom: 12 }}><AlertTriangle size={15}/><span>Missing information: {props.edited.missingInformation.join(', ')}. Please fill in the fields below.</span></div>}
+      {props.edited.priority === 'CRITICAL' && <div className="alert error-alert" style={{ marginBottom: 12, fontWeight: 600 }}><AlertTriangle size={15}/><span>This will be flagged as a critical/emergency incident.</span></div>}
       <form onSubmit={props.onConfirm} className="extraction-form">
         <label>Issue title<input value={props.edited.title} onChange={(event) => props.setEdited({ ...props.edited!, title: event.target.value })} required /></label>
         <label>Department<input value={props.edited.responsibleDepartment ?? ''} onChange={(event) => props.setEdited({ ...props.edited!, responsibleDepartment: event.target.value || null })} placeholder="e.g. Maintenance" required /></label>
@@ -356,11 +686,12 @@ function ReportPage(props: {
     </section> : <div className="report-layout">
       <section className="panel recorder-panel"><div className="panel-heading"><div><h2>Tell us what happened</h2><p>Record up to 30 seconds. A short, clear description is all you need.</p></div><span className="required-label">REQUIRED</span></div>
         <form onSubmit={props.onSubmit}>
-          <label className="language-select">Report language<select value={props.language} onChange={(event) => props.setLanguage(event.target.value)} disabled={props.recording}><option value="hi">Hindi</option><option value="hinglish">Hinglish</option><option value="ta">Tamil</option></select></label>
+          <label className="language-select">Report language<select value={props.language} onChange={(event) => props.setLanguage(event.target.value)} disabled={props.recording}><option value="hi">Hindi — Devanagari (हिन्दी)</option><option value="hinglish">Hinglish — Roman script</option><option value="ta">Tamil — Tamil script (தமிழ்)</option><option value="en">English</option></select></label>
+          {languageLabels[props.language] && <div className="inline-hint" style={{ background: 'var(--accent-subtle)', borderColor: '#c8dce2', color: 'var(--accent-text)' }}><span>Transcript will appear in <strong>{languageLabels[props.language]!.script}</strong> script{props.language === 'hinglish' ? ' (Devanagari automatically converted to Roman letters)' : ''}</span></div>}
           <div className={`recorder ${props.recording ? 'recording' : ''}`}>
             <div className="record-wave"><span/><span/><span/><span/><span/><span/><span/></div>
             <button type="button" className="record-button" onClick={props.recording ? props.onStop : props.onStart} aria-label={props.recording ? 'Stop recording' : 'Start recording'}>{props.recording ? <Pause size={22} fill="currentColor"/> : <Mic size={23}/>}</button>
-            <strong>{props.recording ? 'Listening…' : props.audioUrl ? 'Recording ready' : 'Tap to start recording'}</strong>
+            <strong>{props.recording ? 'Listening — speak now…' : props.audioUrl ? 'Recording ready — review below' : 'Press to start recording'}</strong>
             <span className="record-timer">{mm}:{ss}</span>
             {props.recording && <span className="recording-tag"><i/> RECORDING</span>}
           </div>
@@ -384,16 +715,92 @@ function ReportPage(props: {
 function IncidentsPage({ incidents, search, setSearch, onOpen }: { incidents: Incident[]; search: string; setSearch: (value: string) => void; onOpen: (incident: Incident) => void }) {
   return <><div className="page-title-row"><div><p className="eyebrow">TRACEABLE REPORTS</p><h1>Incidents</h1><p className="subheading">View what was reported, who owns it, and what happens next.</p></div></div>
     <section className="panel list-panel"><div className="list-tools"><div className="search-box"><Search size={16}/><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search issue, location, ID…"/></div><span className="result-count">{incidents.length} {incidents.length === 1 ? 'incident' : 'incidents'}</span></div>
-      {incidents.length ? <div className="table-wrap"><table><thead><tr><th>Incident</th><th>Location</th><th>Priority</th><th>Assigned to</th><th>Deadline</th><th>Status</th></tr></thead><tbody>{incidents.map((incident) => <tr key={incident.id} onClick={() => onOpen(incident)}><td><strong>{incident.title}</strong><small>{incident.incidentNumber}</small></td><td>{incident.location || 'Not specified'}</td><td><Priority value={incident.priority}/></td><td>{incident.tasks?.[0]?.assignee?.name ?? 'Awaiting confirmation'}</td><td>{dateLabel(incident.deadline)}</td><td><span className={statusStyle(incident.status)}>{prettyStatus(incident.status)}</span></td></tr>)}</tbody></table></div> : <EmptyState title="No matching incidents" body="Try a different search or submit a new report."/>}
+      {incidents.length ? <div className="table-wrap"><table><thead><tr><th>Incident</th><th>Location</th><th>Priority</th><th>Assigned to</th><th>Deadline</th><th>Status</th></tr></thead><tbody>{incidents.map((incident) => <tr key={incident.id} onClick={() => onOpen(incident)}><td><strong>{incident.title}</strong><small>{incident.incidentNumber}</small></td><td className="cell-location">{incident.location || 'Not specified'}</td><td><Priority value={incident.priority}/></td><td className="cell-assignee">{incident.tasks?.[0]?.assignee?.name ?? 'Awaiting confirmation'}</td><td className="cell-deadline">{dateLabel(incident.deadline)}</td><td><span className={statusStyle(incident.status)}>{prettyStatus(incident.status)}</span></td></tr>)}</tbody></table></div> : <EmptyState title="No matching incidents" body="Try a different search or submit a new report."/>}
     </section>
   </>;
 }
 
-function TasksPage({ tasks, onUpdate, onOpenIncident }: { tasks: Task[]; onUpdate: (task: Task, status: string) => void; onOpenIncident: (id: string) => void }) {
-  return <><div className="page-title-row"><div><p className="eyebrow">CLEAR OWNERSHIP</p><h1>Tasks</h1><p className="subheading">The actions assigned to you and your team.</p></div></div>
-    <section className="task-list">{tasks.map((task) => <article className="task-card" key={task.id}><div className="task-priority-line"><Priority value={task.incident.priority}/><span className={statusStyle(task.status)}>{prettyStatus(task.status)}</span></div><button className="task-title" onClick={() => onOpenIncident(task.incident.id)}>{task.title}<ChevronRight size={17}/></button><p className="task-parent">{task.incident.incidentNumber} · {task.incident.location ?? 'No location'}</p><div className="task-meta"><span><Clock3 size={14}/> Due {dateLabel(task.deadline)}</span><span className="task-owner"><span className="avatar tiny">{task.assignee.name.split(' ').map((part) => part[0]).slice(0, 2).join('')}</span>{task.assignee.name}</span></div>
-      {!['COMPLETED', 'COMPLETED_BY_ASSIGNEE', 'CLOSED'].includes(task.status) && <div className="task-actions">{task.status !== 'IN_PROGRESS' && <button className="secondary-button" onClick={() => onUpdate(task, 'IN_PROGRESS')}><Play size={14}/> Start task</button>}<button className="primary-button small" onClick={() => onUpdate(task, 'COMPLETED')}><Check size={15}/> Mark complete</button></div>}
-    </article>)}{!tasks.length && <div className="panel"><EmptyState title="No tasks assigned" body="When a report creates work for you, it will show up here."/></div>}</section>
+function TasksPage({ tasks, onComplete, onUpdate, onOpenIncident, loading }: { tasks: Task[]; onComplete: (task: Task) => void; onUpdate: (task: Task, status: string) => void; onOpenIncident: (id: string) => void; loading?: boolean }) {
+  const completableStatuses = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'OVERDUE', 'ESCALATED', 'REOPENED', 'EMERGENCY'];
+
+  return <>
+    <div className="page-title-row">
+      <div>
+        <p className="eyebrow">CLEAR OWNERSHIP</p>
+        <h1>Tasks</h1>
+        <p className="subheading">The actions assigned to you and your team.</p>
+      </div>
+    </div>
+    <section className="panel list-panel">
+      {tasks.length ? (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Task</th>
+                <th>Assigned To</th>
+                <th>Deadline</th>
+                <th>Status</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tasks.map((task) => {
+                const isCompletable = completableStatuses.includes(task.status);
+                return (
+                  <tr key={task.id}>
+                    <td onClick={() => onOpenIncident(task.incident.id)} style={{ cursor: 'pointer' }}>
+                      <strong>{task.title}</strong>
+                      <small>{task.incident.incidentNumber} · {task.incident.location ?? 'No location'}</small>
+                    </td>
+                    <td>{task.assignee.name}</td>
+                    <td>{dateLabel(task.deadline)}</td>
+                    <td>
+                      <span className={statusStyle(task.status)}>{prettyStatus(task.status)}</span>
+                    </td>
+                    <td>
+                      {isCompletable ? (
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                          {task.status !== 'IN_PROGRESS' && (
+                            <button
+                              type="button"
+                              className="secondary-button small"
+                              onClick={() => onUpdate(task, 'IN_PROGRESS')}
+                              disabled={loading}
+                              title="Start task"
+                            >
+                              <Play size={13} /> Start
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="primary-button small"
+                            onClick={() => onComplete(task)}
+                            disabled={loading}
+                          >
+                            <Check size={14} /> Complete Task
+                          </button>
+                        </div>
+                      ) : task.status === 'COMPLETED_BY_ASSIGNEE' ? (
+                        <span className="action-tag verification-pending">
+                          <Clock3 size={13} /> Verification Pending
+                        </span>
+                      ) : (
+                        <span className="action-tag verified-closed">
+                          <Check size={13} /> Closed
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <EmptyState title="No tasks assigned" body="When a report creates work for you, it will show up here." />
+      )}
+    </section>
   </>;
 }
 
@@ -406,11 +813,73 @@ function AuditPage({ events }: { events: Array<{ id: string; action: string; rea
   return <><div className="page-title-row"><div><p className="eyebrow">WHO · WHAT · WHEN · WHY</p><h1>Audit log</h1><p className="subheading">A readable record of workflow actions and decisions.</p></div></div><section className="panel audit-panel">{events.map((event) => <div className="audit-row" key={event.id}><span className="timeline-dot"/><div className="audit-copy"><strong>{prettyStatus(event.action)}</strong><span>{event.reason ?? 'Recorded workflow event.'}</span><small>{event.incident?.incidentNumber ?? 'System event'} · {event.actor?.name ?? 'VoiceBridge'}</small></div><time>{dateLabel(event.createdAt)}</time></div>)}{!events.length && <EmptyState title="No audit events" body="Workflow activity will be recorded here."/>}</section></>;
 }
 
-function IncidentDrawer({ incident, onClose }: { incident: Incident; onClose: () => void }) {
-  return <div className="drawer-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside className="incident-drawer"><div className="drawer-top"><span className="eyebrow">{incident.incidentNumber}</span><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div><h2>{incident.title}</h2><p className="drawer-description">{incident.description}</p><div className="drawer-badges"><Priority value={incident.priority}/><span className={statusStyle(incident.status)}>{prettyStatus(incident.status)}</span></div><div className="detail-grid"><Detail label="Location" value={incident.location ?? 'Not specified'}/><Detail label="Deadline" value={dateLabel(incident.deadline)}/><Detail label="Reported" value={dateLabel(incident.createdAt)}/><Detail label="Assigned to" value={incident.tasks?.[0]?.assignee?.name ?? 'Awaiting confirmation'}/></div><div className="drawer-task"><span className="eyebrow">REQUESTED ACTION</span><strong>{incident.tasks?.[0]?.title ?? 'No task created yet'}</strong><small>{incident.tasks?.[0]?.assignee?.email ?? 'This report is awaiting confirmation.'}</small></div><div className="drawer-footer"><ShieldCheck size={16}/> Activity and notifications are stored in the audit timeline.</div></aside></div>;
+function IncidentDrawer({ incident, currentUser, onCompleteTask, onVerifyClosure, onClose, loading }: { incident: Incident; currentUser: User | null; onCompleteTask: (task: Task) => void; onVerifyClosure: (incident: Incident, response: '1' | '2') => void; onClose: () => void; loading?: boolean }) {
+  const task = incident.tasks?.[0];
+  const isCompletable = task && ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'OVERDUE', 'ESCALATED', 'REOPENED', 'EMERGENCY'].includes(task.status);
+  const isReporter = currentUser && (incident.reporterId === currentUser.id || incident.reporter?.id === currentUser.id || currentUser.role === 'ADMIN');
+  const isPendingVerification = incident.status === 'REPORTER_VERIFICATION_PENDING';
+
+  return <div className="drawer-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside className="incident-drawer">
+    <div className="drawer-top"><span className="eyebrow">{incident.incidentNumber}</span><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div>
+    <h2>{incident.title}</h2>
+    <p className="drawer-description">{incident.description}</p>
+    <div className="drawer-badges"><Priority value={incident.priority}/><span className={statusStyle(incident.status)}>{prettyStatus(incident.status)}</span></div>
+    <div className="detail-grid">
+      <Detail label="Location" value={incident.location ?? 'Not specified'}/>
+      <Detail label="Deadline" value={dateLabel(incident.deadline)}/>
+      <Detail label="Reported" value={dateLabel(incident.createdAt)}/>
+      <Detail label="Assigned to" value={incident.tasks?.[0]?.assignee?.name ?? 'Awaiting confirmation'}/>
+    </div>
+    <div className="drawer-task">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+        <span className="eyebrow" style={{ margin: 0 }}>REQUESTED ACTION</span>
+        {task && <span className={statusStyle(task.status)}>{prettyStatus(task.status)}</span>}
+      </div>
+      <strong>{task?.title ?? 'No task created yet'}</strong>
+      <small>{task?.assignee?.name ? `${task.assignee.name} (${task.assignee.email})` : 'This report is awaiting confirmation.'}</small>
+      {isCompletable && (
+        <div style={{ marginTop: '12px' }}>
+          <button type="button" className="primary-button small" onClick={() => onCompleteTask(task)} disabled={loading}>
+            <Check size={14}/> Complete Task
+          </button>
+        </div>
+      )}
+      {task?.status === 'COMPLETED_BY_ASSIGNEE' && (
+        <div style={{ marginTop: '10px' }}>
+          <span className="action-tag verification-pending"><Clock3 size={13}/> Verification Pending</span>
+        </div>
+      )}
+    </div>
+    {isPendingVerification && (
+      <div className="drawer-verification-banner">
+        <div className="verification-banner-header">
+          <PhoneCall size={15}/>
+          <span>Spoken Verification Pending (IVR Simulation)</span>
+        </div>
+        <p className="verification-prompt-text">{incident.closureVerifications?.[0]?.prompt || 'Work has been marked complete. Does the issue persist?'}</p>
+        {isReporter ? (
+          <div className="verification-banner-actions">
+            <button type="button" className="primary-button small" onClick={() => onVerifyClosure(incident, '1')} disabled={loading}>
+              <Check size={14}/> Press 1 — Confirm & Close
+            </button>
+            <button type="button" className="secondary-button small" onClick={() => onVerifyClosure(incident, '2')} disabled={loading}>
+              <RotateCcw size={14}/> Press 2 — Issue Remains (Reopen)
+            </button>
+          </div>
+        ) : (
+          <small style={{ color: '#8c7b6c' }}>Awaiting closure verification from the original reporter.</small>
+        )}
+      </div>
+    )}
+    <div className="drawer-footer"><ShieldCheck size={16}/> Activity and notifications are stored in the audit timeline.</div>
+  </aside></div>;
 }
 
 function Detail({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function Priority({ value }: { value: string }) { return <span className={`priority priority-${value.toLowerCase()}`}><i/>{value.toLowerCase()}</span>; }
-function prettyStatus(status: string) { return status.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+function prettyStatus(status: string) {
+  if (status === 'COMPLETED_BY_ASSIGNEE') return 'Completed';
+  if (status === 'REPORTER_VERIFICATION_PENDING') return 'Verification Pending';
+  return status.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
 function EmptyState({ title, body, action, onClick }: { title: string; body: string; action?: string; onClick?: () => void }) { return <div className="empty-state"><span><FileAudio2 size={19}/></span><strong>{title}</strong><p>{body}</p>{action && <button className="text-button" onClick={onClick}>{action} <ArrowRight size={14}/></button>}</div>; }

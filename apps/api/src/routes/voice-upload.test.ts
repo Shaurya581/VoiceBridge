@@ -21,9 +21,9 @@ async function withApi(run: (url: string) => Promise<void>, database: DatabaseCl
   }
 }
 
-async function transcribe(url: string, bytes: Uint8Array, contentType = 'audio/webm;codecs=opus') {
+async function transcribe(url: string, bytes: Uint8Array, contentType = 'audio/webm;codecs=opus', language = 'ta') {
   const form = new FormData();
-  form.set('language', 'ta');
+  form.set('language', language);
   const audioBytes = Uint8Array.from(bytes);
   form.set('audio', new File([audioBytes.buffer as ArrayBuffer], 'report.webm', { type: contentType }));
   return fetch(`${url}/api/voice/transcribe`, {
@@ -42,6 +42,74 @@ describe('voice transcription API', () => {
       const response = await transcribe(url, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]));
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ transcript: 'வணக்கம்', language: 'ta', confidence: 0.84 });
+    });
+  });
+
+  it('keeps Hindi transcript in native Devanagari script when language is hi', async () => {
+    vi.stubEnv('STT_PROVIDER', 'mock');
+    vi.stubEnv('MOCK_TRANSCRIPT', 'मशीन 4 से बहुत तेज आवाज आ रही है');
+
+    await withApi(async (url) => {
+      const response = await transcribe(url, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]), 'audio/webm;codecs=opus', 'hi');
+      expect(response.status).toBe(200);
+      const data = await response.json() as { transcript: string; language: string };
+      expect(data.language).toBe('hi');
+      expect(data.transcript).toBe('मशीन 4 से बहुत तेज आवाज आ रही है');
+    });
+  });
+
+  it('transliterates Devanagari to Romanized Hinglish when language is hinglish', async () => {
+    vi.stubEnv('STT_PROVIDER', 'mock');
+    vi.stubEnv('MOCK_TRANSCRIPT', 'पैकेजिंग लाइन के पास मशीन से अजीब आवाज आ रही है');
+
+    await withApi(async (url) => {
+      const response = await transcribe(url, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]), 'audio/webm;codecs=opus', 'hinglish');
+      expect(response.status).toBe(200);
+      const data = await response.json() as { transcript: string; language: string };
+      expect(data.language).toBe('hinglish');
+      expect(data.transcript).toBe('packaging line ke paas machine se ajeeb awaaz aa rahi hai');
+    });
+  });
+
+  it('preserves existing Roman/Latin Hinglish transcript unchanged when language is hinglish', async () => {
+    vi.stubEnv('STT_PROVIDER', 'mock');
+    const original = 'Machine 4 se strange noise aa rahi hai packaging line ke paas';
+    vi.stubEnv('MOCK_TRANSCRIPT', original);
+
+    await withApi(async (url) => {
+      const response = await transcribe(url, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]), 'audio/webm;codecs=opus', 'hinglish');
+      expect(response.status).toBe(200);
+      const data = await response.json() as { transcript: string; language: string };
+      expect(data.language).toBe('hinglish');
+      expect(data.transcript).toBe(original);
+    });
+  });
+
+  it('keeps Tamil transcript in Tamil script when language is ta', async () => {
+    vi.stubEnv('STT_PROVIDER', 'mock');
+    const tamilText = 'பேக்கேஜிங் லைன் அருகில் இயந்திரம் அதிக சத்தம் செய்கிறது';
+    vi.stubEnv('MOCK_TRANSCRIPT', tamilText);
+
+    await withApi(async (url) => {
+      const response = await transcribe(url, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]), 'audio/webm;codecs=opus', 'ta');
+      expect(response.status).toBe(200);
+      const data = await response.json() as { transcript: string; language: string };
+      expect(data.language).toBe('ta');
+      expect(data.transcript).toBe(tamilText);
+    });
+  });
+
+  it('keeps English transcript in Latin script when language is en', async () => {
+    vi.stubEnv('STT_PROVIDER', 'mock');
+    const englishText = 'The machine is making a strange noise near the packaging line.';
+    vi.stubEnv('MOCK_TRANSCRIPT', englishText);
+
+    await withApi(async (url) => {
+      const response = await transcribe(url, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]), 'audio/webm;codecs=opus', 'en');
+      expect(response.status).toBe(200);
+      const data = await response.json() as { transcript: string; language: string };
+      expect(data.language).toBe('en');
+      expect(data.transcript).toBe(englishText);
     });
   });
 

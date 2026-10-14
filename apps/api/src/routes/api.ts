@@ -18,6 +18,7 @@ import { configuredExtractionProvider } from '../services/extraction.js';
 import { speakStatus } from '../services/voice-feedback.js';
 import { canTransitionIncident } from '../services/safety.js';
 import { canonicalAudioMimeType, validateAudioFile } from '../services/audio-validation.js';
+import { transliterateHinglish, hasDevanagari } from '../services/transliterate.js';
 
 const uploadDirectory = path.resolve(fileURLToPath(new URL('../../../../uploads/', import.meta.url)));
 const extensions: Record<string, string> = {
@@ -86,7 +87,7 @@ const manualIncidentSchema = z.object({
   assigneeId: z.string().min(1).optional()
 });
 const taskStatusSchema = z.object({ status: z.enum(['IN_PROGRESS', 'COMPLETED']) });
-const languageSchema = z.enum(['hi', 'hinglish', 'ta']).default('hi');
+const languageSchema = z.enum(['hi', 'hinglish', 'ta', 'en']).default('hi');
 
 export function apiRouter(db: DatabaseClient | null) {
   const router = Router();
@@ -121,9 +122,13 @@ export function apiRouter(db: DatabaseClient | null) {
       const rawTranscription = request.file
         ? await speechProvider().transcribe(preparedAudio!.audioPath, canonicalAudioMimeType(request.file.mimetype), language, transcriptFromClient || undefined)
         : { transcript: transcriptFromClient, language, confidence: null, audioQuality: 'UNKNOWN' as const };
-      const transcription = rawTranscription.audioQuality === 'UNKNOWN' && preparedAudio
+      let transcription = rawTranscription.audioQuality === 'UNKNOWN' && preparedAudio
         ? { ...rawTranscription, audioQuality: preparedAudio.quality }
         : rawTranscription;
+      // When the reporter selected Hinglish, normalize Devanagari → Roman script
+      if (transcription.language === 'hinglish' && hasDevanagari(transcription.transcript)) {
+        transcription = { ...transcription, transcript: transliterateHinglish(transcription.transcript) };
+      }
       await db.voiceReport.update({ where: { id: report.id }, data: {
         transcript: transcription.transcript, language: transcription.language, transcriptionConfidence: transcription.confidence,
         audioQuality: transcription.audioQuality
@@ -167,7 +172,10 @@ export function apiRouter(db: DatabaseClient | null) {
       const language = languageSchema.parse(request.body.language);
       const prepared = await audioPreprocessor().prepare(request.file.path);
       const transcription = await speechProvider().transcribe(prepared.audioPath, canonicalAudioMimeType(request.file.mimetype), language);
-      const result = transcription.audioQuality === 'UNKNOWN' ? { ...transcription, audioQuality: prepared.quality } : transcription;
+      let result = transcription.audioQuality === 'UNKNOWN' ? { ...transcription, audioQuality: prepared.quality } : transcription;
+      if (result.language === 'hinglish' && hasDevanagari(result.transcript)) {
+        result = { ...result, transcript: transliterateHinglish(result.transcript) };
+      }
       if (db) await db.auditLog.create({ data: { actorId: request.user!.sub, action: 'TRANSCRIPTION_COMPLETED', reason: `Speech-to-text provider returned ${result.language}.`, metadata: { confidence: result.confidence } } });
       return response.json(result);
     } finally {
@@ -247,7 +255,8 @@ export function apiRouter(db: DatabaseClient | null) {
       : { reporterId: user.sub };
     const incidents = await db.incident.findMany({ where, orderBy: { createdAt: 'desc' }, include: {
       reporter: { select: { id: true, name: true, email: true } },
-      tasks: { include: { assignee: { select: { id: true, name: true, email: true } } } }
+      tasks: { include: { assignee: { select: { id: true, name: true, email: true } } } },
+      closureVerifications: { orderBy: { createdAt: 'desc' }, take: 1 }
     } });
     return response.json({ incidents });
   }));
@@ -293,6 +302,7 @@ export function apiRouter(db: DatabaseClient | null) {
     const incident = await db.incident.findUnique({ where: { id: routeParam(request, 'id') }, include: {
       reporter: { select: { id: true, name: true, email: true } },
       voiceReports: true,
+      closureVerifications: { orderBy: { createdAt: 'desc' }, take: 1 },
       tasks: { include: { assignee: { select: { id: true, name: true, email: true, managerId: true } }, assignments: { include: { employee: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: 'desc' } }, reminders: { orderBy: { scheduledAt: 'desc' } }, escalations: { include: { manager: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: 'desc' } }, notifications: { orderBy: { createdAt: 'desc' } } } },
       notifications: { orderBy: { createdAt: 'desc' } }, auditEvents: { orderBy: { createdAt: 'asc' }, include: { actor: { select: { id: true, name: true } } } }
     } });
@@ -380,7 +390,7 @@ export function apiRouter(db: DatabaseClient | null) {
     const managerAccess = request.user!.role === 'MANAGER' || request.user!.role === 'ADMIN';
     if (task.assigneeId !== request.user!.sub && !managerAccess) return response.status(403).json({ error: 'Only the assignee or a manager can update this task.' });
     if (request.user!.role === 'MANAGER' && task.assigneeId !== request.user!.sub && task.assignee.managerId !== request.user!.sub && task.incident.reporterId !== request.user!.sub) return response.status(403).json({ error: 'You cannot access this task.' });
-    const allowed: Record<string, string[]> = { OPEN: ['IN_PROGRESS', 'COMPLETED'], IN_PROGRESS: ['COMPLETED'], OVERDUE: ['IN_PROGRESS', 'COMPLETED'], ESCALATED: ['IN_PROGRESS', 'COMPLETED'], REOPENED: ['IN_PROGRESS', 'COMPLETED'], EMERGENCY: ['IN_PROGRESS', 'COMPLETED'] };
+    const allowed: Record<string, string[]> = { OPEN: ['IN_PROGRESS', 'COMPLETED'], ASSIGNED: ['IN_PROGRESS', 'COMPLETED'], IN_PROGRESS: ['COMPLETED'], OVERDUE: ['IN_PROGRESS', 'COMPLETED'], ESCALATED: ['IN_PROGRESS', 'COMPLETED'], REOPENED: ['IN_PROGRESS', 'COMPLETED'], EMERGENCY: ['IN_PROGRESS', 'COMPLETED'] };
     if (!allowed[task.status]?.includes(parsed.status)) return response.status(409).json({ error: `Cannot move a task from ${task.status} to ${parsed.status}.` });
     if (parsed.status === 'IN_PROGRESS' && !canTransitionIncident(task.incident.status, 'IN_PROGRESS')) return response.status(409).json({ error: `Cannot move an incident from ${task.incident.status} to IN_PROGRESS.` });
     if (parsed.status === 'COMPLETED') {
@@ -393,7 +403,14 @@ export function apiRouter(db: DatabaseClient | null) {
       }
     }
     const updated = await db.$transaction(async (tx) => {
-      const newTask = await tx.task.update({ where: { id: task.id }, data: { status: parsed.status } });
+      const newTask = await tx.task.update({
+        where: { id: task.id },
+        data: { status: parsed.status },
+        include: {
+          incident: { select: { id: true, incidentNumber: true, title: true, location: true, priority: true, status: true } },
+          assignee: { select: { id: true, name: true, email: true } }
+        }
+      });
       await tx.incident.update({ where: { id: task.incidentId }, data: { status: parsed.status } });
       await tx.auditLog.create({ data: { actorId: request.user!.sub, incidentId: task.incidentId, action: 'TASK_STARTED', reason: 'Status updated by an authorized task owner or manager.', metadata: { taskId: task.id, status: parsed.status } } });
       return newTask;
